@@ -1,52 +1,78 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/ip.h>
+#include<stdio.h> // for prinf
+#include<unistd.h> // for close
+#include<sys/socket.h>  // for socket connet
+#include <stdlib.h>  // exit
+#include <arpa/inet.h> // sockaddr_in, htons, htonl, INADDR_LOOPBACK
+#include <string.h> // strlen
 
-// die() must be defined BEFORE it's used
-static void die(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
-    abort();
+
+static void die(const char *msg){
+    perror(msg);
+    exit(1);
 }
 
-int main() {
-    // step 1: create a socket
+//helper : read exactly n bytes
+static int32_t read_full(int fd, char* buf, size_t n){
+    while( n > 0){
+        ssize_t rv = read(fd, buf, n);
+         if(rv <= 0)return -1;
+         
+
+         n-=(size_t)rv;
+         buf+=rv;
+    }
+
+    return 0;
+}
+
+
+// helper : to write or send the n bytes to the server. 
+static int32_t write_all(int fd, const char* buf, size_t n){
+    while( n > 0){
+        ssize_t rv = write(fd, buf, n);
+
+        if(rv <=0 )return -1;
+
+        n-= (size_t)rv;
+        buf+=rv;
+    }
+    return 0;
+}
+
+int main(){
+
+    // step1 : socket same as server
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        die("socket()");
-    }
+    if(fd < 0) die("socket()");
 
-    // step 2: set up the server's address
-    struct sockaddr_in addr{};
-    // note: addr = the address we want to connect to (the server), not our own address
-    // INADDR_LOOPBACK = localhost, 127.0.0.1, since both server and client are on the same machine
-    addr.sin_family = AF_INET;              // ipv4 connection
-    addr.sin_port = ntohs(1234);
-    addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
+    // step 2 : describe the server's address which is localHost in this case
+    struct sockaddr_in addr ={};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(1234);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 localhost
 
-    // step 3: connect
+    // step3 connect() -> dial the server
+    // bind+listen+accept happnes in server side
     int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
-    if (rv) {   // 0 = success, non-zero = failure
-        die("connect");
-    }
+    if(rv <0)die("connect()");
+
 
     // step 4: send a message
-    char msg[] = "hello";
-    write(fd, msg, strlen(msg));
+    char wbuf[] = "hello";
+    write(fd, wbuf, strlen(wbuf));
 
-    // step 5: read the reply
+    // step 5 : read the server's reply
+
     char rbuf[64] = {};
-    ssize_t n = read(fd, rbuf, sizeof(rbuf) - 1); // ssize_t so it can hold -1 on failure
-    if (n < 0) {
-        die("read");
-    }
-    printf("server says: %s\n", rbuf);
+    ssize_t n = read_full(fd, rbuf, 4);
 
-    // step 6: close the connection
+    if(n < 0)die("read()");
+
+    printf("Server sent : %s\n", rbuf);
+
+    // step 6: hang up
     close(fd);
+
+
     return 0;
 }
