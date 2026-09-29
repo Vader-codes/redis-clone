@@ -2,8 +2,10 @@
 #include<unistd.h> // for close
 #include<sys/socket.h>  // for socket
 #include <stdlib.h> 
-#include <arpa/inet.h>
+#include <arpa/inet.h> 
 #include <string.h>
+#include<errno.h>
+
 
 // helper function to close the socket
 static void die(const char *msg){
@@ -13,7 +15,7 @@ static void die(const char *msg){
 
 
 
-//helper : read exactly n bytes
+//helper : read exactly n bytes 
 static int32_t read_full(int fd, char* buf, size_t n){
     while( n > 0){
         ssize_t rv = read(fd, buf, n);
@@ -27,6 +29,7 @@ static int32_t read_full(int fd, char* buf, size_t n){
     return 0;
 }
 
+
 // helper : to write or send the n bytes to the client 
 static int32_t write_all(int fd, const char* buf, size_t n){
     while( n > 0){
@@ -39,6 +42,55 @@ static int32_t write_all(int fd, const char* buf, size_t n){
     }
     return 0;
 }
+
+// handle one request on an open connection
+// read a request , write a response, Return 0 on success -1 on failure
+static int32_t one_request(int connfd){
+    char rbuf[4+64] = {};  // 4 bytes for length 64 for message body
+    errno = 0;
+    int32_t err = read_full(connfd, rbuf, 4);
+    if (err)
+    {
+        if(errno == 0){
+            printf("EOF\n");
+        }else{
+            printf("read()  errno\n");
+        }
+        return err;
+    }
+
+        // interept the 4 bytes as  uint32_t 
+        uint32_t len =0;
+        memcpy(&len, rbuf, 4); // assume little endian
+
+        if(len > 64){
+            printf("Message is too long!\n");
+            return -1;
+        }
+        // read the body (len bytes)
+        err = read_full(connfd, &rbuf[4], len);
+         if (err) {
+        printf("read() error (body)\n");
+        return err;
+        }
+       // print the message
+        printf("client says: %.*s\n", (int)len, &rbuf[4]);
+
+
+        
+        // build the response
+        const char reply[] = "world";
+        uint32_t reply_len = (uint32_t)strlen(reply);
+        char wbuf[4 + sizeof(reply)];
+        memcpy(wbuf, &reply_len, 4);
+        memcpy(&wbuf[4], reply, reply_len);
+
+        // send it
+        return write_all(connfd, wbuf, 4 + reply_len);
+    
+}
+
+
 
 int main(){
      // step 1
@@ -61,7 +113,7 @@ int main(){
     
     // step 2 : claim it
     int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
-    if(rv < 0) die("listen()");
+    if(rv < 0) die("bind()");
      // we got the ticket
       printf("Bound to port 1234!\n");
    
@@ -69,7 +121,7 @@ int main(){
 
     //step 3 : start accepting connections , queue up to SOMAXCONN waiting clients
     rv = listen(fd, SOMAXCONN);
-    if(rv < 0) die("bind()");
+    if(rv < 0) die("listen()");
      printf("listening to port 1234!\n");
     
 
@@ -88,25 +140,15 @@ int main(){
 
         printf("New client connected! connfd = %d :\n", connfd);
 
-        // step 5 read what the client sent (up to 63 bytes + null operator)
-        char rbuf[4+64] = {};  // 4 bytes for length 64 for message body
-        int32_t err = read_full(connfd, rbuf, 4); 
-        if(err){
-            printf("read() error (length)\n");
-            close(connfd);
-            continue;
+        // serve this client until it disconnects or error
+        while(true){
+            int32_t err = one_request(connfd);
+            if(err)
+                break;
         }
-
-        // interept the message as a uint32_t 
-        uint32_t len =0;
-        memcpy(&len, rbuf, 4); // assume little endian
-        printf("client says : %s \n", rbuf);s
-        // send a reply
-        char wbuf[] = "world";
-        write(connfd, wbuf, sizeof(wbuf));
-        close(connfd); // for now 
+        close(connfd);
+        printf("client disconnected\n");
     }
-    close(fd);
 
     return 0;
 }
