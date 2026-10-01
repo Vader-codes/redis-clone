@@ -35,6 +35,49 @@ static void make_nonblocking(int fd)
     fcntl(fd, F_SETFL, flags);         // set the flags
 }
 
+// try to parse one request form conn->incoming
+//  returns true if a request was parsed , false if we need more data
+static bool try_one_request(Conn *conn)
+{
+    // need at least 4bytes for the length prefix
+    if (conn->incoming.size() < 4)
+    {
+        return false; // not enough data yet
+    }
+    // read the 4 byte length prefix
+    uint32_t len = 0;
+    memcpy(&len, conn->incoming.data(), 4);
+
+    if (len > 64)
+    {
+        printf("message too long\n");
+        conn->want_close = true;
+        return false;
+    }
+    // need the full body too
+    if (4 + len > conn->incoming.size())
+    {
+        return false; // body not fully arrived yet
+    }
+
+    // we have a complete message
+    const uint8_t *request = &conn->incoming[4];
+    printf("client says %.*s\n", (int)len, request);
+
+    // build the response : [4-byte length ][body]
+    const char reply[] = "world";
+    uint32_t reply_len = (uint32_t)strlen(reply);
+
+    // append length prefix to outgoing
+    conn->outgoing.insert(conn->outgoing.end(), (uint8_t *)&reply_len, (uint8_t *)&reply_len + 4);
+
+    // append body to outgoing
+    conn->outgoing.insert(conn->outgoing.end(), (uint8_t *)reply, (uint8_t *)reply + reply_len);
+
+    // remove the consumed request from incoming
+    conn->incoming.erase(conn->incoming.begin(), conn->incoming.begin() + 4 + len);
+    return true;
+}
 int main()
 {
     // skeleton of our event loop
@@ -101,7 +144,7 @@ int main()
             {
                 cpfd.events |= POLLIN;
             }
-            if (conn->want->write)
+            if (conn->want_write)
             {
                 cpfd.events |= POLLOUT;
             }
@@ -142,7 +185,86 @@ int main()
             }
             fd2conn[connfd] = conn; // it will point to the memory addres of client's conn state
             printf("New client connected ! connfd : %d\n", connfd);
-            close(connfd);
+        }
+
+        // handle the client fds
+        // poll_args[0] is the lisnening fd, so clients starts at index1
+        for (size_t i = 1; i < poll_args.size(); i++)
+        {
+            uint32_t ready = poll_args[i].revents;
+            Conn *conn = fd2conn[poll_args[i].fd];
+
+            if (ready & POLLIN)
+            {
+                // read some bytes into temporary buffer
+                uint8_t buf[64 * 1024];
+                ssize_t rv = read(conn->fd, buf, sizeof(buf));
+
+                if (rv <= 0)
+                {
+                    // client closed (rv ==0)or error(rv < 0);
+                    printf("client %d is disconnected\n", conn->fd);
+                    conn->want_close = true;
+                    continue;
+                }
+                // append the bytes into the client's buffer
+                conn->incoming.insert(conn->incoming.end(), buf, buf + rv);
+                printf("client %d sent %zd bytes (total: %zu)\n", conn->fd, rv, conn->incoming.size());
+
+                // try to parse as many complete requests as possible
+                while (try_one_request(conn))
+                {
+                    // keep going while there are complete requests
+                }
+                // if we produced a response , switch to want -write
+                if (conn->outgoing.size() > 0)
+                {
+                    conn->want_read = false;
+                    conn->want_write = true;
+                }
+            }
+            if (ready & POLLOUT)
+            {
+                // write some bytes from outgoing to the socket
+                ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
+                if (rv <= 0)
+                {
+                    printf("client %d write error\n", conn->fd);
+                    conn->want_close = true;
+                    continue;
+                }
+                // remove written bytes from outgoing cause we have sent them to client no need to store taht
+                conn->outgoing.erase(conn->outgoing.begin(), conn->outgoing.begin() + rv);
+
+                printf("client %d wrote %zd bytes (remaining : %zu)\n", conn->fd, rv, conn->outgoing.size());
+
+                // all sent go back to reading
+                if (conn->outgoing.size() == 0)
+                {
+                    conn->want_read = true;
+                    conn->want_write = false;
+                }
+            }
+            if (ready & POLLERR)
+            {
+                printf("client %d has an error!\n", conn->fd);
+            }
+        }
+
+        // cleanup clients marked up for close --
+        for (size_t i = 1; i < poll_args.size(); i++)
+        {
+            Conn *conn = fd2conn[poll_args[i].fd]; // get the clients state
+            if (!conn)
+                continue; // if null continue
+            if (conn->want_close)
+            {
+                close(conn->fd);
+                fd2conn[conn->fd] = NULL;
+                delete conn;
+                printf("client cleaned up \n");
+            }
         }
     }
 
