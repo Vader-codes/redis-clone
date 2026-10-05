@@ -10,15 +10,117 @@
 #include <poll.h>
 using namespace std;
 
+// maximun message our server can receive (32MB)
+const size_t k_max_msg = 32 << 20; // 32* 2^20
+
+// growable byte buffer with 0(1) consume from the front
+struct Buffer
+{
+    uint8_t *buffer_begin = NULL; // start of allocated memory
+    uint8_t *buffer_end = NULL;   // one past end of allocation
+    uint8_t *data_begin = NULL;   // first unread byte
+    uint8_t *data_end = NULL;     // one past unread byte
+};
+
+// consume n bytes from the front (0 (1)) - just moves a pointer
+static void buf_consume(Buffer *buf, size_t n)
+{
+    buf->data_begin += n;
+
+    if (buf->data_begin == buf->data_end)
+    {
+        // buffer is now empty - reset both to the start
+        // reclaims all space at once
+        buf->data_begin = buf->buffer_begin;
+        buf->data_end = buf->buffer_begin;
+    }
+}
+
+// append len bytes to the buffer , growing or compacting as needed
+static void buf_append(Buffer *buf, const uint8_t *data, size_t len)
+{
+    // first append : allocate initial block
+    if (buf->buffer_begin == NULL)
+    {
+        size_t init_size = (len < 64) ? 64 : len; // at least 64bytes
+        buf->buffer_begin = (uint8_t *)malloc(init_size);
+        buf->buffer_end = buf->buffer_begin + init_size;
+        buf->data_begin = buf->buffer_begin;
+        buf->data_end = buf->buffer_begin;
+    }
+    // we have already allocated space, check how much is left
+    size_t back_room = (size_t)(buf->buffer_end - buf->data_end);
+    if (back_room < len)
+    {
+        // not enough room at the back - try compacting
+        size_t data_size = (size_t)(buf->data_end - buf->data_begin);
+
+        if (buf->data_begin > buf->buffer_begin)
+        {
+            // there's used space at the front  - move data back to the start
+            memmove(buf->buffer_begin, buf->data_begin, data_size);
+            buf->data_begin = buf->buffer_begin;
+            buf->data_end = buf->buffer_begin + data_size;
+
+            // recompute the backroom
+            back_room = (size_t)(buf->data_end - buf->buffer_end);
+        }
+
+        if (back_room < len)
+        {
+            // still not enough reallocate double the size
+            size_t old_size = (size_t)(buf->buffer_end - buf->buffer_begin);
+            size_t new_size = old_size * 2;
+
+            if (new_size < old_size + len)
+            {
+                new_size = old_size + len; // make sure it fits
+            }
+            uint8_t *new_block = (uint8_t *)malloc(new_size);
+            memcpy(new_block, buf->data_begin, data_size); // recopy the previous data to new block
+            free(buf->buffer_begin);                       // free the old data
+
+            buf->buffer_begin = new_block;
+            buf->buffer_end = new_block + new_size;
+            buf->data_begin = new_block;
+            buf->data_end = new_block + data_size;
+        }
+    }
+    // now there's definetely enough space - copy the new data
+    memcpy(buf->data_end, data, len);
+    buf->data_end += len;
+}
+
+// free the buffer's memory
+static void free_buffer(Buffer *buf)
+{
+    free(buf->buffer_begin);
+
+    buf->buffer_begin = buf->buffer_end = NULL;
+    buf->data_begin = buf->data_end = NULL;
+}
+// how many unread bytes are currently in the buffer?
+static size_t buf_data_size(const Buffer *buf)
+{
+    return (size_t)(buf->data_end - buf->data_begin);
+}
+
+// pointer to the first unread byte
+static uint8_t *buf_data(const Buffer *buf)
+{
+    return buf->data_begin;
+}
 // per Client state , remembered across event loop iterations
 struct Conn
 {
-    int fd = -1;              // socket for this client
-    bool want_read = false;   //"tell me when this client has data to read"
-    bool want_write = false;  //"tell me when this client has data to write"
-    bool want_close = false;  // "close this client at the end of the iteration"
-    vector<uint8_t> incoming; // bytes received, not yet processed one byte per element
-    vector<uint8_t> outgoing; // bytes to send back
+    int fd = -1;             // socket for this client
+    bool want_read = false;  //"tell me when this client has data to read"
+    bool want_write = false; //"tell me when this client has data to write"
+    bool want_close = false; // "close this client at the end of the iteration"
+                             // was: vector<uint8_t> incoming
+    Buffer incoming;         // bytes received, not yet processed one byte per element
+                             // was: vector<uint8_t> outgoing
+    Buffer outgoing;         // bytes to send back /
 };
 // print error and exit
 static void die(const char *msg)
@@ -40,42 +142,42 @@ static void make_nonblocking(int fd)
 static bool try_one_request(Conn *conn)
 {
     // need at least 4bytes for the length prefix
-    if (conn->incoming.size() < 4)
+    if (buf_data_size(&conn->incoming) < 4)
     {
         return false; // not enough data yet
     }
     // read the 4 byte length prefix
     uint32_t len = 0;
-    memcpy(&len, conn->incoming.data(), 4);
+    memcpy(&len, buf_data(&conn->incoming), 4);
 
-    if (len > 64)
+    if (len > k_max_msg)
     {
         printf("message too long\n");
         conn->want_close = true;
         return false;
     }
     // need the full body too
-    if (4 + len > conn->incoming.size())
+    if (4 + len > buf_data_size(&conn->incoming))
     {
         return false; // body not fully arrived yet
     }
 
     // we have a complete message
-    const uint8_t *request = &conn->incoming[4];
-    printf("client says %.*s\n", (int)len, request);
+    const uint8_t *request = buf_data(&conn->incoming) + 4;
+    // print only the first 32 chars to avoid spamming the terminal
+    printf("client says %.32s%s (len=%u)\n", request, len > 32 ? "..." : "", len);
 
     // build the response : [4-byte length ][body]
     const char reply[] = "world";
     uint32_t reply_len = (uint32_t)strlen(reply);
 
     // append length prefix to outgoing
-    conn->outgoing.insert(conn->outgoing.end(), (uint8_t *)&reply_len, (uint8_t *)&reply_len + 4);
+    buf_append(&conn->outgoing, (uint8_t *)&reply_len, 4);
 
     // append body to outgoing
-    conn->outgoing.insert(conn->outgoing.end(), (uint8_t *)reply, (uint8_t *)reply + reply_len);
-
+    buf_append(&conn->outgoing, (uint8_t *)reply, reply_len);
     // remove the consumed request from incoming
-    conn->incoming.erase(conn->incoming.begin(), conn->incoming.begin() + 4 + len);
+    buf_consume(&conn->incoming, 4 + len);
     return true;
 }
 int main()
@@ -208,25 +310,63 @@ int main()
                     continue;
                 }
                 // append the bytes into the client's buffer
-                conn->incoming.insert(conn->incoming.end(), buf, buf + rv);
-                printf("client %d sent %zd bytes (total: %zu)\n", conn->fd, rv, conn->incoming.size());
+                buf_append(&conn->incoming, buf, rv);
+                printf("client %d sent %zd bytes (total: %zu)\n", conn->fd, rv, buf_data_size(&conn->incoming));
 
                 // try to parse as many complete requests as possible
                 while (try_one_request(conn))
                 {
                     // keep going while there are complete requests
                 }
-                // if we produced a response , switch to want -write
-                if (conn->outgoing.size() > 0)
+                // // if we produced a response , switch to want -write
+                // if (conn->outgoing.size() > 0)
+                // {
+                //     conn->want_read = false;
+                //     conn->want_write = true;
+                // }
+
+                // if we produced a response, try to write it now (optimistic)
+                if (buf_data_size(&conn->outgoing) > 0)
                 {
-                    conn->want_read = false;
-                    conn->want_write = true;
+                    ssize_t rv = write(conn->fd, buf_data(&conn->outgoing), buf_data_size(&conn->outgoing));
+
+                    if (rv < 0 && errno == EAGAIN)
+                    {
+                        // socket not ready right now - let poll() tell us later
+                        conn->want_read = false;
+                        conn->want_write = true;
+                    }
+                    else if (rv < 0)
+                    {
+                        // real error
+                        printf("client %d write error\n", conn->fd);
+                        conn->want_close = true;
+                        continue;
+                    }
+                    else
+                    {
+                        // write succeeded - remove written bytes
+                        buf_consume(&conn->outgoing, rv);
+                        printf("client %d wrote %zd bytes (remaining : %zu)\n", conn->fd, rv, buf_data_size(&conn->outgoing));
+                        // if everything went out , keep reading
+                        if (buf_data_size(&conn->outgoing) == 0)
+                        {
+                            conn->want_read = true;
+                            conn->want_write = false;
+                        }
+                        else
+                        {
+                            // partial write — need to wait for room
+                            conn->want_read = false;
+                            conn->want_write = true;
+                        }
+                    }
                 }
             }
             if (ready & POLLOUT)
             {
                 // write some bytes from outgoing to the socket
-                ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+                ssize_t rv = write(conn->fd, buf_data(&conn->outgoing), buf_data_size(&conn->outgoing));
 
                 if (rv <= 0)
                 {
@@ -235,12 +375,12 @@ int main()
                     continue;
                 }
                 // remove written bytes from outgoing cause we have sent them to client no need to store taht
-                conn->outgoing.erase(conn->outgoing.begin(), conn->outgoing.begin() + rv);
+                buf_consume(&conn->outgoing, rv);
 
-                printf("client %d wrote %zd bytes (remaining : %zu)\n", conn->fd, rv, conn->outgoing.size());
+                printf("client %d wrote %zd bytes (remaining : %zu)\n", conn->fd, rv, buf_data_size(&conn->outgoing));
 
                 // all sent go back to reading
-                if (conn->outgoing.size() == 0)
+                if (buf_data_size(&conn->outgoing) == 0)
                 {
                     conn->want_read = true;
                     conn->want_write = false;
@@ -262,6 +402,8 @@ int main()
             {
                 close(conn->fd);
                 fd2conn[conn->fd] = NULL;
+                free_buffer(&conn->incoming); // free incoming buffer
+                free_buffer(&conn->outgoing); // free outggoing buffer
                 delete conn;
                 printf("client cleaned up \n");
             }
