@@ -5,6 +5,7 @@
 #include <arpa/inet.h>  // sockaddr_in, htons, htonl, INADDR_LOOPBACK
 #include <string.h>     // strlen
 #include <string>
+#include <vector>
 using namespace std;
 
 static void die(const char *msg)
@@ -45,6 +46,70 @@ static int32_t write_all(int fd, const char *buf, size_t n)
     return 0;
 }
 
+// send a request : a list of strings , wrapped in length prefixed protocol
+static int32_t send_req(int fd, const vector<string> &cmd)
+{
+    // build the body first (we don't know its size unitl it's done)
+    vector<uint8_t> buf;
+
+    // how many strings are in this command?
+    uint32_t nstr = (uint32_t)cmd.size();
+    buf.insert(buf.end(), (uint8_t *)&nstr, (uint8_t *)&nstr + 4);
+
+    // append each string as [4-byte lenth][bytes]
+    for (const string &s : cmd)
+    {
+        uint32_t len = (uint32_t)s.size();
+        buf.insert(buf.end(), (uint8_t *)&len, (uint8_t *)&len + 4);
+        buf.insert(buf.end(), (const uint8_t *)s.data(), (const uint8_t *)s.data() + len);
+    }
+
+    // now that we know the body size , send the outer 4-byte length first
+    uint32_t total = (uint32_t)buf.size();
+    int32_t err = write_all(fd, (char *)&total, 4); // first we send the total response size in first 4bytes
+    if (err)
+        return err;
+
+    // the we send the body itself
+    return write_all(fd, (char *)buf.data(), buf.size());
+}
+
+// read a response
+// read one response from the server and prints it
+// response format : [outer_len][status(4B)][data]
+static int32_t read_res(int fd)
+{
+    char rbuf[4];                         // buffer for outer length
+    int32_t err = read_full(fd, rbuf, 4); // read outer length
+
+    if (err)
+    {
+        printf("read_full(length) failed \n"); // report error and bail
+        return err;
+    }
+
+    uint32_t len = 0;      // will hold the message body size
+    memcpy(&len, rbuf, 4); // copy bytes into the number
+
+    vector<uint8_t> body(len);                     // allocate space for the body
+    err = read_full(fd, (char *)body.data(), len); // read the full body
+
+    if (err)
+    {
+        printf("read_full(body) failed\n"); // report and bail
+        return err;
+    }
+    uint32_t status = 0;
+    memcpy(&status, body.data(), 4);        // first 4 bytes of body = status
+    printf("status = %u, data = ", status); // print status prefix
+
+    if (len > 4)
+    {                                                    // if there's more that just status
+        printf("%.*s", (int)(len - 4), body.data() + 4); // print data bytes as string
+    }
+    printf("\n");
+    return 0; // sucsss
+}
 int main()
 {
 
@@ -65,80 +130,19 @@ int main()
     if (rv < 0)
         die("connect()");
 
-    // // step 4: send a message
-    // const char *msgs[] = {"hello1", "hello2", "hello3"};
-    // for (int i = 0; i < 3; i++)
-    // {
-    //     const char *msg = msgs[i];
+    // send some commannds and read responses
+    send_req(fd, {"set", "name", "bipin"}); // stores name = bipin
+    read_res(fd);                           // expect : OK, no data
 
-    //     uint32_t msg_len = (uint32_t)strlen(msg);
+    send_req(fd, {"get", "name"}); // look up name
+    read_res(fd);                  // expect: OK, data=Rishi
 
-    //     // create a buffer to send
-    //     char wbuf[4 + 64];              // 4 byte for message length and 5 is hard typed hello size
-    //     memcpy(wbuf, &msg_len, 4);      // length prefix
-    //     memcpy(&wbuf[4], msg, msg_len); // body
+    send_req(fd, {"del", "name"}); // delete name
+    read_res(fd);                  // expect: OK, data=<binary 1>
 
-    //     int32_t err = write_all(fd, wbuf, 4 + msg_len);
-    //     if (err)
-    //         die("write()");
-    //     printf("sent: %s\n", msg);
-    // }
+    send_req(fd, {"get", "name"}); // look up deleted key
+    read_res(fd);                  // expect: not found
 
-    // now read 3 responses
-    // for (int i = 0; i < 3; i++)
-    // {
-    //     char rbuf[4 + 64];
-    //     // step5 read server's reply
-    //     // read the full length
-    //     int32_t err = read_full(fd, rbuf, 4);
-    //     if (err)
-    //         die("read_full(length)");
-
-    //     uint32_t reply_len = 0;
-    //     memcpy(&reply_len, rbuf, 4);
-
-    //     // read the reply body
-    //     err = read_full(fd, &rbuf[4], reply_len);
-    //     if (err)
-    //         die("read_full(body)");
-
-    //     printf("Server sent : %.*s\n", (int)reply_len, &rbuf[4]);
-    // }
-
-    // let's send a larget file to the server
-    const size_t k_big = 1024 * 1024; // 1 MB
-    string big(k_big, 'z');
-
-    uint32_t msg_len = (uint32_t)big.size();
-
-    char wbuf[4 + 64]; // header only body will be send seperately
-    memcpy(wbuf, &msg_len, 4);
-
-    // send length prefix
-    int32_t err = write_all(fd, wbuf, 4);
-    if (err)
-        die("write_all(length)");
-
-    // send body
-    err = write_all(fd, big.data(), msg_len);
-
-    printf("send %u bytes\n", msg_len);
-
-    // read the response
-    char rbuf[4 + 64];
-    err = read_full(fd, rbuf, 4); // reading only head 4bytes
-    if (err)
-        die("read_full (lenth)");
-
-    uint32_t reply_len = 0;
-    memcpy(&reply_len, rbuf, 4); // reading the length of the message
-
-    err = read_full(fd, &rbuf[4], reply_len);
-    if (err)
-        die("read_full (body)");
-
-    printf("server sent: %.*s\n", (int)reply_len, &rbuf[4]);
-
-    close(fd);
+    close(fd); // hung up
     return 0;
 }

@@ -8,6 +8,8 @@
 #include <fcntl.h>      // fnctl, O_NONBlock
 #include <vector>       // vector in c++
 #include <poll.h>
+#include <string>
+#include <map>
 using namespace std;
 
 // maximun message our server can receive (32MB)
@@ -137,6 +139,152 @@ static void make_nonblocking(int fd)
     fcntl(fd, F_SETFL, flags);         // set the flags
 }
 
+// try to read a 4-byte  uint_32 at 'cur'
+// if enough bytes remain, store it in 'out' and advance 'cur' by 4.
+//  returns false if not enough bytes
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out)
+{
+    if (cur + 4 > end)
+    {
+        return false; // we do not have enough bytes
+    }
+    memcpy(&out, cur, 4); // copy 4 bytes into out
+    cur += 4;             // advance cursor by 4
+    return true;
+}
+
+// try to read `n` bytes at `cur` into `out`.
+// if enough bytes remain, copy them and advance `cur` by n.
+// returns false if not enough bytes.
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, string &out)
+{
+    if (cur + n > end)
+    {
+        return false; // not enough bytes
+    }
+    out.assign(cur, cur + n); // copy n bytes  into out
+    cur += n;                 // move the cursor by n bytes
+    return true;
+}
+
+// parse a request body into a list of strings.
+// reutrns 0 on success, -1 on error
+static int32_t parse_req(const uint8_t *data, size_t size, vector<string> &out)
+{
+    const uint8_t *end = data + size;
+    const uint8_t *cur = data;
+
+    // how many strings ?
+    uint32_t nstr = 0;
+
+    if (!read_u32(cur, end, nstr))
+    {
+        return -1;
+    }
+    if (nstr > 1000)
+    { // safety limit
+        return -1;
+    }
+
+    // read each string
+    while (out.size() < nstr)
+    {
+        uint32_t len = 0;
+        if (!read_u32(cur, end, len)) // read the length
+        {
+            return -1;
+        }
+        out.push_back(string()); // add empty string
+
+        if (!read_str(cur, end, len, out.back())) // fill it out.back() points to last empty string
+        {
+            return -1;
+        }
+    }
+    // make sure we consumed the whole message
+    if (cur != end)
+    {
+        return -1; // trailing garbage
+    }
+    return 0;
+}
+
+// the result of processing a request
+struct Response
+{
+    uint32_t status = 0; // 0 = OK ,1 = not found , 2 = error
+    vector<uint8_t> data;
+};
+// status codes for responses
+const uint32_t RES_OK = 0;
+const uint32_t RES_NX = 1;  // "not found"
+const uint32_t RES_ERR = 2; // "error"
+
+// temporary key-value store — replaced with a real hashtable later
+static map<string, string> g_data;
+
+// process a parsed command and fill the response
+static void do_request(vector<string> &cmd, Response &out)
+{
+    if (cmd.size() == 3 && cmd[0] == "set")
+    {
+        // set key value
+        g_data[cmd[1]].swap(cmd[2]); // we could used cmd[1] = cmd[2] , that will copy but we swap the pointers
+    }
+    else if (cmd.size() == 2 && cmd[0] == "get")
+    {
+        // get key
+        auto it = g_data.find(cmd[1]);
+        if (it == g_data.end())
+        {
+            out.status = RES_NX; // not found
+            return;
+        }
+        const string &val = it->second;
+        out.data.assign(val.begin(), val.end());
+    }
+    else if (cmd.size() == 2 && cmd[0] == "del")
+    {
+        // del key
+        size_t n = g_data.erase(cmd[1]);
+        out.data.assign((uint8_t *)&n, (uint8_t *)&n + 8); // 8-byte size_t
+    }
+    else
+    {
+        out.status = RES_ERR; // unknown command
+    }
+}
+
+// serialize a Response into the outgoing Buffer
+static void make_response(const Response &resp, Buffer *out)
+{
+    // 4-byte status code
+    uint32_t status = resp.status;
+    buf_append(out, (uint8_t *)&status, 4);
+
+    // optional data
+    if (!resp.data.empty())
+    {
+        buf_append(out, resp.data.data(), resp.data.size());
+    }
+}
+
+// reserve 4bytes for the message header. remember where they are
+static size_t response_begin(Buffer *out)
+{
+    size_t header_pros = buf_data_size(out); // position before writing
+    uint8_t zero[4] = {0};                   // place holder
+    buf_append(out, zero, 4);
+    return header_pros;
+}
+
+// patch the reserved header with the actual message size
+static void response_end(Buffer *out, size_t header_pros)
+{
+    size_t msg_size = buf_data_size(out) - header_pros - 4; // total minnus header
+    uint32_t len = (uint32_t)msg_size;
+    memcpy(buf_data(out) + header_pros, &len, 4);
+}
 // try to parse one request form conn->incoming
 //  returns true if a request was parsed , false if we need more data
 static bool try_one_request(Conn *conn)
@@ -162,21 +310,36 @@ static bool try_one_request(Conn *conn)
         return false; // body not fully arrived yet
     }
 
-    // we have a complete message
-    const uint8_t *request = buf_data(&conn->incoming) + 4;
-    // print only the first 32 chars to avoid spamming the terminal
-    printf("client says %.32s%s (len=%u)\n", request, len > 32 ? "..." : "", len);
+    // hardcoded response - request
+    //  {   // we have a complete message
+    //     const uint8_t *request = buf_data(&conn->incoming) + 4;
+    //     // print only the first 32 chars to avoid spamming the terminal
+    //     printf("client says %.32s%s (len=%u)\n", request, len > 32 ? "..." : "", len);
+    //     // build the response : [4-byte length ][body]
+    //     const char reply[] = "world";
+    //     uint32_t reply_len = (uint32_t)strlen(reply);}
 
-    // build the response : [4-byte length ][body]
-    const char reply[] = "world";
-    uint32_t reply_len = (uint32_t)strlen(reply);
+    // the message body is after 4-byte length prefix
+    const uint8_t *body = buf_data(&conn->incoming) + 4;
 
-    // append length prefix to outgoing
-    buf_append(&conn->outgoing, (uint8_t *)&reply_len, 4);
+    // parse the request into the list of strings
+    vector<string> cmd;
+    if (parse_req(body, len, cmd) < 0)
+    {
+        printf("bad request \n");
+        conn->want_close = true;
+        return false;
+    }
+    // process the command fill the response
+    Response resp;
+    do_request(cmd, resp);
 
-    // append body to outgoing
-    buf_append(&conn->outgoing, (uint8_t *)reply, reply_len);
-    // remove the consumed request from incoming
+    // reserve the first 4 bytes of the response header, build the body
+    size_t header_pros = response_begin(&conn->outgoing);
+    make_response(resp, &conn->outgoing);
+    response_end(&conn->outgoing, header_pros);
+
+    // consume the parsed request from incoming
     buf_consume(&conn->incoming, 4 + len);
     return true;
 }
