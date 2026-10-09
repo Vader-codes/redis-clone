@@ -20,6 +20,17 @@ const size_t k_rehashing_work = 128; // migrate at most this many per call
 
 const size_t k_max_load_factor = 8; // max keys per slot before resizing
 
+// response type tags (TLV format)
+const uint8_t TAG_NIL = 0; // nothing
+const uint8_t TAG_ERR = 1; // error
+const uint8_t TAG_STR = 2; // string
+const uint8_t TAG_INT = 3; // 64-bit integer
+const uint8_t TAG_DBL = 4; // 64-bit double (unused for now)
+const uint8_t TAG_ARR = 5; // array
+
+const uint32_t ERR_UNKNOWN = 1; // unknown command
+const uint32_t ERR_BAD_ARG = 2; // wrong arguments
+
 // given a pointer to a member, compute the address of its containing struct
 #define container_of(ptr, T, member) \
     ((T *)((char *)(ptr) - offsetof(T, member)))
@@ -102,6 +113,24 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len)
     buf->data_end += len;
 }
 
+// append a single byte into the buffer
+static void buf_append_u8(Buffer *out, uint8_t byte)
+{
+    buf_append(out, &byte, 1);
+}
+
+// append a 4-byte uint32_t
+static void buf_append_u32(Buffer *out, uint32_t val)
+{
+    buf_append(out, (uint8_t *)&val, 4);
+}
+
+// append an 8-byte int64_t
+static void buf_append_i64(Buffer *out, int64_t val)
+{
+    buf_append(out, (uint8_t *)&val, 8);
+}
+
 // free the buffer's memory
 static void free_buffer(Buffer *buf)
 {
@@ -133,11 +162,150 @@ static uint64_t str_hash(const uint8_t *data, size_t len)
     return h;
 }
 
+// intrusive AVL tree node
+struct AVLNode
+{
+    AVLNode *parent = NULL; // parent node (for rank queries)
+    AVLNode *left = NULL;   // left child (smaller)
+    AVLNode *right = NULL;  // right child (bigger)
+    uint32_t height = 1;
+    uint32_t cnt = 1; // subtree size , for rank queries
+};
+
+// height of a subtree (0 for empty)
+static uint32_t avl_height(AVLNode *node)
+{
+    return node ? node->height : 0;
+}
+
+// subtree size (0 for empty)
+static uint32_t avl_cnt(AVLNode *node)
+{
+    return node ? node->cnt : 0;
+}
+
+// recompute a node's height and cnt from its children
+static void avl_update(AVLNode *node)
+{
+    node->height = 1 + max(avl_height(node->left), avl_height(node->right));
+    node->cnt = 1 + avl_cnt(node->left) + avl_cnt(node->right);
+}
+
+// rotate node's right child up (fixes right-heavy)
+static AVLNode *rot_left(AVLNode *node)
+{
+    AVLNode *parent = node->parent; // save old parent
+    AVLNode *new_top = node->right; // D becomes the new top
+    AVLNode *inner = new_top->left; // C (moves to node's right)
+
+    // node.right = inner
+    node->right = inner;
+    if (inner)
+        inner->parent = node;
+
+    // new_top.parent = old parent
+    new_top->parent = parent;
+
+    // new_top.left = node
+    new_top->left = node;
+    node->parent = new_top;
+
+    // update heights (bottom-up)
+    avl_update(node);
+    avl_update(new_top);
+
+    return new_top; // caller links this to old parent
+}
+
+// rotate node's left child up (fixes left-heavy)
+static AVLNode *rot_right(AVLNode *node)
+{
+    AVLNode *parent = node->parent;
+    AVLNode *new_top = node->left;
+    AVLNode *inner = new_top->right;
+
+    node->left = inner;
+    if (inner)
+        inner->parent = node;
+
+    new_top->parent = parent;
+
+    new_top->right = node;
+    node->parent = new_top;
+
+    avl_update(node);
+    avl_update(new_top);
+
+    return new_top;
+}
+
+// fix a left-heavy node: rotation(s) to restore balance
+static AVLNode *avl_fix_left(AVLNode *node)
+{
+    // if inner subtree is taller, rotate left first (LR case)
+    if (avl_height(node->left->left) < avl_height(node->left->right))
+    {
+        node->left = rot_left(node->left);
+    }
+    return rot_right(node);
+}
+
+// fix a right-heavy node: rotation(s) to restore balance
+static AVLNode *avl_fix_right(AVLNode *node)
+{
+    if (avl_height(node->right->right) < avl_height(node->right->left))
+    {
+        node->right = rot_right(node->right);
+    }
+    return rot_left(node);
+}
+
+// walk up from `node`, update heights, fix imbalances.
+// returns the new root of the whole tree.
+static AVLNode *avl_fix(AVLNode *node)
+{
+    while (true)
+    {
+        AVLNode **from = &node; // where this subtree links from
+        AVLNode *parent = node->parent;
+        if (parent)
+        { // if not root
+            from = parent->left == node ? &parent->left : &parent->right;
+        }
+
+        avl_update(node); // recompute height
+
+        // check balance
+        uint32_t l = avl_height(node->left);
+        uint32_t r = avl_height(node->right);
+        if (l == r + 2)
+        {
+            *from = avl_fix_left(node);
+        }
+        else if (l + 2 == r)
+        {
+            *from = avl_fix_right(node);
+        }
+
+        if (!parent)
+            return *from; // reached root — done
+        node = parent;    // continue upward
+    }
+}
+
 // intrusive hashtable node - embedded inside the data it indexes
 struct HNode
 {
     HNode *next = nullptr; // linked list pointer for chaining
     uint64_t hcode = 0;    // cached hash value of the key
+};
+
+// a fixed - size hashtable (array of chain head)
+struct HTab
+{
+    HNode **tab = NULL; // array of slots ;each slot is a pointer to a chain head
+    size_t mask = 0;    // array size -1 capacity of our hash table
+    size_t size = 0;    // numbers of keys currently stored
 };
 
 // one key-value pair with an embedded hashtable node
@@ -148,6 +316,56 @@ struct Entry
     string val; // the value
 };
 
+// initialize the hashtable with n slots (n must be a power of 2)
+static void h_init(HTab *htab, size_t n)
+{
+    assert(n > 0 && ((n - 1) & n) == 0); // n must be a power of 2
+
+    htab->tab = (HNode **)calloc(n, sizeof(HNode *)); // zeroed array
+    htab->mask = n - 1;
+    htab->size = 0;
+}
+
+// insert a node into the hashtable
+static void h_insert(HTab *htab, HNode *node)
+{
+    size_t slot = node->hcode & htab->mask; // find the slot from the hash
+    HNode *next = htab->tab[slot];          // current chain head at that slot
+    node->next = next;                      // new node points to old head
+    htab->tab[slot] = node;                 // new node becomes the head
+    htab->size++;                           // one more key stored
+}
+
+// find a node by key. returns a pointer to the pointer that points to it,
+// or NULL if not found. the caller supplies an equality function.
+static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *))
+{
+    if (!htab->tab)
+    {                // not initialized
+        return NULL; // nothing to search
+    }
+    size_t slot = key->hcode & htab->mask; // which slot?
+    HNode **from = &htab->tab[slot];       // pointer-to-pointer, starts at the slot
+
+    for (HNode *cur; (cur = *from) != NULL; from = &cur->next)
+    {
+        if (cur->hcode == key->hcode && eq(cur, key))
+        {                // hash matches AND key matches
+            return from; // found — return pointer to it
+        }
+    }
+    return NULL; // not found
+}
+
+// remove the node that `from` points to. returns the removed node.
+static HNode *h_detach(HTab *htab, HNode **from)
+{
+    HNode *node = *from; // the node to remove
+    *from = node->next;  // skip over it in the chain
+    htab->size--;        // one fewer key
+    return node;
+}
+
 // compare two nodes by their keys (used in h_lookup)
 static bool entry_eq(HNode *lhs, HNode *rhs)
 {
@@ -156,13 +374,6 @@ static bool entry_eq(HNode *lhs, HNode *rhs)
 
     return le->key == re->key; // compare key
 }
-// a fixed - size hashtable (array of chain head)
-struct HTab
-{
-    HNode **tab = NULL; // array of slots ;each slot is a pointer to a chain head
-    size_t mask = 0;    // array size -1 capacity of our hash table
-    size_t size = 0;    // numbers of keys currently stored
-};
 
 // a resizable hashtable — uses two HTabs during rehashing
 struct HMap
@@ -268,56 +479,6 @@ static HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *))
     return NULL; // not found in either
 }
 
-// initialize the hashtable with n slots (n must be a power of 2)
-static void h_init(HTab *htab, size_t n)
-{
-    assert(n > 0 && ((n - 1) & n) == 0); // n must be a power of 2
-
-    htab->tab = (HNode **)calloc(n, sizeof(HNode *)); // zeroed array
-    htab->mask = n - 1;
-    htab->size = 0;
-}
-
-// insert a node into the hashtable
-static void h_insert(HTab *htab, HNode *node)
-{
-    size_t slot = node->hcode & htab->mask; // find the slot from the hash
-    HNode *next = htab->tab[slot];          // current chain head at that slot
-    node->next = next;                      // new node points to old head
-    htab->tab[slot] = node;                 // new node becomes the head
-    htab->size++;                           // one more key stored
-}
-
-// find a node by key. returns a pointer to the pointer that points to it,
-// or NULL if not found. the caller supplies an equality function.
-static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *))
-{
-    if (!htab->tab)
-    {                // not initialized
-        return NULL; // nothing to search
-    }
-    size_t slot = key->hcode & htab->mask; // which slot?
-    HNode **from = &htab->tab[slot];       // pointer-to-pointer, starts at the slot
-
-    for (HNode *cur; (cur = *from) != NULL; from = &cur->next)
-    {
-        if (cur->hcode == key->hcode && eq(cur, key))
-        {                // hash matches AND key matches
-            return from; // found — return pointer to it
-        }
-    }
-    return NULL; // not found
-}
-
-// remove the node that `from` points to. returns the removed node.
-static HNode *h_detach(HTab *htab, HNode **from)
-{
-    HNode *node = *from; // the node to remove
-    *from = node->next;  // skip over it in the chain
-    htab->size--;        // one fewer key
-    return node;
-}
-
 // per Client state , remembered across event loop iterations
 struct Conn
 {
@@ -416,29 +577,11 @@ static int32_t parse_req(const uint8_t *data, size_t size, vector<string> &out)
     return 0;
 }
 
-// the result of processing a request
-struct Response
-{
-    uint32_t status = 0; // 0 = OK ,1 = not found , 2 = error
-    vector<uint8_t> data;
-};
-// status codes for responses
-const uint32_t RES_OK = 0;
-const uint32_t RES_NX = 1;  // "not found"
-const uint32_t RES_ERR = 2; // "error"
-
 // temporary key-value store — replaced with a real hashtable later
 // static map<string, string> g_data;
 
 // the global key-value store (our custom hashtable)
 static HMap g_data;
-
-// a temporary "key only" struct used for lookups
-struct LookupKey
-{
-    HNode node; // must be first
-    string key;
-};
 
 // process a parsed command and fill the response
 // static void do_request(vector<string> &cmd, Response &out)
@@ -471,10 +614,54 @@ struct LookupKey
 //         out.status = RES_ERR; // unknown command
 //     }
 // }
+// write a nil response (just the tag)
+static void out_nil(Buffer *out)
+{
+    buf_append_u8(out, TAG_NIL);
+}
+
+// write a string response: [TAG_STR][4-byte length][bytes]
+static void out_str(Buffer *out, const char *s, size_t len)
+{
+    buf_append_u8(out, TAG_STR);
+    buf_append_u32(out, (uint32_t)len);
+    buf_append(out, (const uint8_t *)s, len);
+}
+
+// write an integer response: [TAG_INT][8-byte int64]
+static void out_int(Buffer *out, int64_t val)
+{
+    buf_append_u8(out, TAG_INT);
+    buf_append_i64(out, val);
+}
+
+// start writing an array. returns a position to patch later.
+static size_t out_arr_begin(Buffer *out)
+{
+    buf_append_u8(out, TAG_ARR);     // tag
+    size_t pos = buf_data_size(out); // remember where count goes
+    buf_append_u32(out, 0);          // reserve 4 bytes for count
+    return pos;                      // caller patches this later
+}
+
+// finish the array: write the actual count
+static void out_arr_end(Buffer *out, size_t pos, uint32_t count)
+{
+    memcpy(buf_data(out) + pos, &count, 4); // patch the count
+}
+
+// write an error response: [TAG_ERR][4-byte code][4-byte len][message]
+static void out_err(Buffer *out, uint32_t code, const char *msg)
+{
+    buf_append_u8(out, TAG_ERR);
+    buf_append_u32(out, code);
+    buf_append_u32(out, (uint32_t)strlen(msg));
+    buf_append(out, (const uint8_t *)msg, strlen(msg));
+}
 
 // rewriteing the do_request functions with our custom hashTable
 // process a parsed command and fill the response
-static void do_request(vector<string> &cmd, Response &out)
+static void do_request(vector<string> &cmd, Buffer *out)
 {
     if (cmd.size() == 3 && cmd[0] == "set")
     {
@@ -498,6 +685,7 @@ static void do_request(vector<string> &cmd, Response &out)
             ent->node.hcode = key.node.hcode;
             hm_insert(&g_data, &ent->node);
         }
+        out_nil(out); // set returns nil
     }
     else if (cmd.size() == 2 && cmd[0] == "get")
     {
@@ -508,11 +696,11 @@ static void do_request(vector<string> &cmd, Response &out)
         HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
         if (!node)
         {
-            out.status = RES_NX;
+            out_nil(out); // not found - nil
             return;
         }
         Entry *ent = container_of(node, Entry, node);
-        out.data.assign(ent->val.begin(), ent->val.end());
+        out_str(out, ent->val.data(), ent->val.size()); // found a string
     }
     else if (cmd.size() == 2 && cmd[0] == "del")
     {
@@ -523,28 +711,16 @@ static void do_request(vector<string> &cmd, Response &out)
         HNode *node = hm_delete(&g_data, &key.node, &entry_eq);
         if (!node)
         {
-            out.status = RES_NX;
+            out_int(out, 0); // nothing deleted
             return;
         }
         Entry *ent = container_of(node, Entry, node);
         delete ent;
+        out_int(out, 1); // one key deleted
     }
     else
     {
-        out.status = RES_ERR;
-    }
-}
-// serialize a Response into the outgoing Buffer
-static void make_response(const Response &resp, Buffer *out)
-{
-    // 4-byte status code
-    uint32_t status = resp.status;
-    buf_append(out, (uint8_t *)&status, 4);
-
-    // optional data
-    if (!resp.data.empty())
-    {
-        buf_append(out, resp.data.data(), resp.data.size());
+        out_err(out, ERR_UNKNOWN, "unkown command");
     }
 }
 
@@ -610,13 +786,14 @@ static bool try_one_request(Conn *conn)
         conn->want_close = true;
         return false;
     }
-    // process the command fill the response
-    Response resp;
-    do_request(cmd, resp);
 
-    // reserve the first 4 bytes of the response header, build the body
+    // reserve 4 bytes for the response
     size_t header_pros = response_begin(&conn->outgoing);
-    make_response(resp, &conn->outgoing);
+
+    // process the command - writes TLV directly to outgoing
+    do_request(cmd, &conn->outgoing);
+
+    // patch the response header with the actual size
     response_end(&conn->outgoing, header_pros);
 
     // consume the parsed request from incoming

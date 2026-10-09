@@ -74,41 +74,63 @@ static int32_t send_req(int fd, const vector<string> &cmd)
     return write_all(fd, (char *)buf.data(), buf.size());
 }
 
-// read a response
-// read one response from the server and prints it
-// response format : [outer_len][status(4B)][data]
+// read one request from the server, parse the TLV tag, print it
+// read one response from the server, parse the TLV tag, print it
 static int32_t read_res(int fd)
 {
-    char rbuf[4];                         // buffer for outer length
-    int32_t err = read_full(fd, rbuf, 4); // read outer length
-
+    // read the outer length
+    char hdr[4];
+    int32_t err = read_full(fd, hdr, 4);
     if (err)
     {
-        printf("read_full(length) failed \n"); // report error and bail
+        printf("read_full(length) failed\n");
         return err;
     }
 
-    uint32_t len = 0;      // will hold the message body size
-    memcpy(&len, rbuf, 4); // copy bytes into the number
+    uint32_t len = 0;
+    memcpy(&len, hdr, 4);
 
-    vector<uint8_t> body(len);                     // allocate space for the body
-    err = read_full(fd, (char *)body.data(), len); // read the full body
-
+    // read the whole response body
+    vector<uint8_t> body(len);
+    err = read_full(fd, (char *)body.data(), len);
     if (err)
     {
-        printf("read_full(body) failed\n"); // report and bail
+        printf("read_full(body) failed\n");
         return err;
     }
-    uint32_t status = 0;
-    memcpy(&status, body.data(), 4);        // first 4 bytes of body = status
-    printf("status = %u, data = ", status); // print status prefix
 
-    if (len > 4)
-    {                                                    // if there's more that just status
-        printf("%.*s", (int)(len - 4), body.data() + 4); // print data bytes as string
+    // first byte is the tag
+    uint8_t tag = body[0];
+
+    if (tag == 0)
+    { // TAG_NIL
+        printf("(nil)\n");
     }
-    printf("\n");
-    return 0; // sucsss
+    else if (tag == 2)
+    { // TAG_STR
+        uint32_t slen = 0;
+        memcpy(&slen, body.data() + 1, 4); // next 4 bytes = string length
+        printf("%.*s\n", (int)slen, body.data() + 5);
+    }
+    else if (tag == 3)
+    { // TAG_INT
+        int64_t val = 0;
+        memcpy(&val, body.data() + 1, 8); // next 8 bytes = int64
+        printf("(int) %lld\n", (long long)val);
+    }
+    else if (tag == 1)
+    { // TAG_ERR
+        uint32_t code = 0;
+        memcpy(&code, body.data() + 1, 4); // 4 bytes: error code
+        uint32_t msglen = 0;
+        memcpy(&msglen, body.data() + 5, 4); // 4 bytes: message length
+        printf("(err) %u: %.*s\n", code, (int)msglen, body.data() + 9);
+    }
+    else
+    {
+        printf("(unknown tag %d)\n", tag);
+    }
+    return 0;
 }
 int main()
 {
