@@ -139,6 +139,7 @@ static void free_buffer(Buffer *buf)
     buf->buffer_begin = buf->buffer_end = NULL;
     buf->data_begin = buf->data_end = NULL;
 }
+
 // how many unread bytes are currently in the buffer?
 static size_t buf_data_size(const Buffer *buf)
 {
@@ -160,6 +161,192 @@ static uint64_t str_hash(const uint8_t *data, size_t len)
         h = (h + data[i]) * 16777619; // FNV prime
     }
     return h;
+}
+
+// intrusive hashtable node - embedded inside the data it indexes
+struct HNode
+{
+    HNode *next = nullptr; // linked list pointer for chaining
+    uint64_t hcode = 0;    // cached hash value of the key
+};
+
+// a fixed - size hashtable (array of chain head)
+struct HTab
+{
+    HNode **tab = NULL; // array of slots ;each slot is a pointer to a chain head
+    size_t mask = 0;    // array size -1 capacity of our hash table
+    size_t size = 0;    // numbers of keys currently stored
+};
+
+// one key-value pair with an embedded hashtable node
+struct Entry
+{
+    HNode node; // intrusive node (must be first for cleaner code)
+    string key; // the key
+    string val; // the value
+};
+
+// a resizable hashtable — uses two HTabs during rehashing
+struct HMap
+{
+    HTab newer;             // new table (inserts go here)
+    HTab older;             // old table (being drained during rehash)
+    size_t migrate_pos = 0; // where we are in the migration of older
+};
+
+// initialize the hashtable with n slots (n must be a power of 2)
+static void h_init(HTab *htab, size_t n)
+{
+    assert(n > 0 && ((n - 1) & n) == 0); // n must be a power of 2
+
+    htab->tab = (HNode **)calloc(n, sizeof(HNode *)); // zeroed array
+    htab->mask = n - 1;
+    htab->size = 0;
+}
+
+// insert a node into the hashtable
+static void h_insert(HTab *htab, HNode *node)
+{
+    size_t slot = node->hcode & htab->mask; // find the slot from the hash
+    HNode *next = htab->tab[slot];          // current chain head at that slot
+    node->next = next;                      // new node points to old head
+    htab->tab[slot] = node;                 // new node becomes the head
+    htab->size++;                           // one more key stored
+}
+
+// find a node by key. returns a pointer to the pointer that points to it,
+// or NULL if not found. the caller supplies an equality function.
+static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *))
+{
+    if (!htab->tab)
+    {                // not initialized
+        return NULL; // nothing to search
+    }
+    size_t slot = key->hcode & htab->mask; // which slot?
+    HNode **from = &htab->tab[slot];       // pointer-to-pointer, starts at the slot
+
+    for (HNode *cur; (cur = *from) != NULL; from = &cur->next)
+    {
+        if (cur->hcode == key->hcode && eq(cur, key))
+        {                // hash matches AND key matches
+            return from; // found — return pointer to it
+        }
+    }
+    return NULL; // not found
+}
+
+// remove the node that `from` points to. returns the removed node.
+static HNode *h_detach(HTab *htab, HNode **from)
+{
+    HNode *node = *from; // the node to remove
+    *from = node->next;  // skip over it in the chain
+    htab->size--;        // one fewer key
+    return node;
+}
+
+// compare two nodes by their keys (used in h_lookup)
+static bool entry_eq(HNode *lhs, HNode *rhs)
+{
+    Entry *le = container_of(lhs, Entry, node); // get the left half entry
+    Entry *re = container_of(rhs, Entry, node); // get the right half entry
+
+    return le->key == re->key; // compare key
+}
+
+// begin rehashing: move newer → older, allocate a bigger newer
+static void hm_trigger_rehashing(HMap *hmap)
+{
+    hmap->older = hmap->newer;                        // old new becomes "older"
+    h_init(&hmap->newer, (hmap->newer.mask + 1) * 2); // allocate newer with double size
+    hmap->migrate_pos = 0;                            // start migrating from slot 0
+}
+
+// migrate a few entries from older to newer. called on every operation.
+static void hm_help_rehashing(HMap *hmap)
+{
+    if (hmap->older.tab == NULL)
+    {
+        return; // not rehashing
+    }
+
+    size_t nwork = 0;
+    while (nwork < k_rehashing_work && hmap->older.size > 0)
+    {
+        // move to the next non-empty slot
+        HNode **from = &hmap->older.tab[hmap->migrate_pos];
+        if (!*from)
+        {
+            hmap->migrate_pos++; // empty slot — skip it
+            continue;
+        }
+
+        // move one node from older to newer
+        HNode *moved = h_detach(&hmap->older, from);
+        h_insert(&hmap->newer, moved);
+        nwork++;
+    }
+
+    // if older is empty, free it
+    if (hmap->older.size == 0 && hmap->older.tab)
+    {
+        free(hmap->older.tab);
+        hmap->older.tab = NULL;
+    }
+}
+
+// find a node by key, checking both tables during rehashing
+static HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *))
+{
+    hm_help_rehashing(hmap); // do a little migration
+
+    HNode **from = h_lookup(&hmap->newer, key, eq); // search newer first
+    if (!from)
+    {                                           // not in newer?
+        from = h_lookup(&hmap->older, key, eq); // try older
+    }
+    return from ? *from : NULL; // dereference or return NULL
+}
+
+// insert a node. triggers rehashing when the table gets too full.
+static void hm_insert(HMap *hmap, HNode *node)
+{
+    if (!hmap->newer.tab)
+    {                            // first insert? initialize the table
+        h_init(&hmap->newer, 4); // start with 4 slots
+    }
+
+    h_insert(&hmap->newer, node); // always insert into newer
+
+    if (!hmap->older.tab)
+    { // not already rehashing?
+        size_t threshold = (hmap->newer.mask + 1) * k_max_load_factor;
+        if (hmap->newer.size >= threshold)
+        {
+            hm_trigger_rehashing(hmap); // time to grow
+        }
+    }
+
+    hm_help_rehashing(hmap); // do a little migration
+}
+
+// remove a node. searches both tables during rehashing.
+static HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *))
+{
+    hm_help_rehashing(hmap); // do a little migration
+
+    HNode **from = h_lookup(&hmap->newer, key, eq); // try newer
+    if (from)
+    {
+        return h_detach(&hmap->newer, from); // found in newer — detach
+    }
+
+    from = h_lookup(&hmap->older, key, eq); // try older
+    if (from)
+    {
+        return h_detach(&hmap->older, from); // found in older — detach
+    }
+
+    return NULL; // not found in either
 }
 
 // intrusive AVL tree node
@@ -445,6 +632,49 @@ static AVLNode *avl_offset(AVLNode *node, int64_t offset)
     return node;
 }
 
+// one member of a sorted set: score + name, indexed two ways
+struct ZNode
+{
+    AVLNode treeNode; // index by (score, name) — sorted order
+    HNode hmap;       // index by name — fast lookup
+    double score;     // sort key
+    string name;      // unique member name
+};
+
+// a sorted set: two indexes over the same ZNodes
+struct ZSet
+{
+    AVLNode *root = NULL; // the tree (sorted by score)
+    HMap hmap;            // the hashtable (indexed by name)
+};
+
+static ZSet g_zset; // the global sorted set
+
+// compare two ZNodes by (score, name) — tree ordering
+static bool zless(AVLNode *lhs, AVLNode *rhs)
+{
+    ZNode *a = container_of(lhs, ZNode, treeNode);
+    ZNode *b = container_of(rhs, ZNode, treeNode);
+
+    if (a->score != b->score)
+        return a->score < b->score; // score first
+    return a->name < b->name;       // tie-break by name
+}
+
+// compare two ZNodes by name — for the hashtable
+static bool hnode_eq(HNode *lhs, HNode *rhs)
+{
+    ZNode *a = container_of(lhs, ZNode, hmap);
+    ZNode *b = container_of(rhs, ZNode, hmap);
+    return a->name == b->name;
+}
+
+// the callback avl_insert uses (delegates to zless)
+static bool avl_less(AVLNode *lhs, AVLNode *rhs)
+{
+    return zless(lhs, rhs);
+}
+
 // insert a new node into the tree, then rebalance
 static void avl_insert(AVLNode **root, AVLNode *new_node)
 {
@@ -476,190 +706,367 @@ static void avl_insert(AVLNode **root, AVLNode *new_node)
     *root = avl_fix(new_node); // rebalance up to root
 }
 
-// intrusive hashtable node - embedded inside the data it indexes
-struct HNode
+// update an existing member's score (hashtable stays — name didn't change)
+static void zset_update(ZSet *zset, ZNode *zn, double score)
 {
-    HNode *next = nullptr; // linked list pointer for chaining
-    uint64_t hcode = 0;    // cached hash value of the key
-};
+    if (zn->score == score)
+        return; // no change
 
-// a fixed - size hashtable (array of chain head)
-struct HTab
-{
-    HNode **tab = NULL; // array of slots ;each slot is a pointer to a chain head
-    size_t mask = 0;    // array size -1 capacity of our hash table
-    size_t size = 0;    // numbers of keys currently stored
-};
+    // remove from tree
+    zset->root = avl_del(&zn->treeNode);
+    zn->treeNode = AVLNode{}; // reset the node
 
-// one key-value pair with an embedded hashtable node
-struct Entry
-{
-    HNode node; // intrusive node (must be first for cleaner code)
-    string key; // the key
-    string val; // the value
-};
-
-// initialize the hashtable with n slots (n must be a power of 2)
-static void h_init(HTab *htab, size_t n)
-{
-    assert(n > 0 && ((n - 1) & n) == 0); // n must be a power of 2
-
-    htab->tab = (HNode **)calloc(n, sizeof(HNode *)); // zeroed array
-    htab->mask = n - 1;
-    htab->size = 0;
+    // update score + re-insert into tree
+    zn->score = score;
+    avl_insert(&zset->root, &zn->treeNode);
 }
 
-// insert a node into the hashtable
-static void h_insert(HTab *htab, HNode *node)
+// Lookup / insert / delete
+//  find a ZNode by name using the hashtable
+static ZNode *zset_lookup(ZSet *zset, const char *name, size_t len)
 {
-    size_t slot = node->hcode & htab->mask; // find the slot from the hash
-    HNode *next = htab->tab[slot];          // current chain head at that slot
-    node->next = next;                      // new node points to old head
-    htab->tab[slot] = node;                 // new node becomes the head
-    htab->size++;                           // one more key stored
+    if (!zset->root)
+        return NULL; // empty set
+
+    // build a lookup key
+    ZNode key;
+    key.name.assign(name, len); // copy name
+    key.hmap.hcode = str_hash((uint8_t *)name, len);
+
+    HNode *node = hm_lookup(&zset->hmap, &key.hmap, &hnode_eq);
+    if (!node)
+        return NULL;
+    // the hashtable returns a HNode — convert back to ZNode
+    return container_of(node, ZNode, hmap);
 }
 
-// find a node by key. returns a pointer to the pointer that points to it,
-// or NULL if not found. the caller supplies an equality function.
-static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *))
+// insert a new member or update an existing one's score.
+// returns true if new, false if updated.
+static bool zset_insert(ZSet *zset, const char *name, size_t len, double score)
 {
-    if (!htab->tab)
-    {                // not initialized
-        return NULL; // nothing to search
-    }
-    size_t slot = key->hcode & htab->mask; // which slot?
-    HNode **from = &htab->tab[slot];       // pointer-to-pointer, starts at the slot
-
-    for (HNode *cur; (cur = *from) != NULL; from = &cur->next)
+    // if it exists, update score
+    if (ZNode *zn = zset_lookup(zset, name, len))
     {
-        if (cur->hcode == key->hcode && eq(cur, key))
-        {                // hash matches AND key matches
-            return from; // found — return pointer to it
+        zset_update(zset, zn, score); // yes → just change score
+        return false;                 // returns false = "updated, not added"
+    }
+
+    // new member: create + insert into both indexes
+    ZNode *zn = new ZNode();
+    zn->name.assign(name, len);
+    zn->score = score;
+    zn->treeNode = AVLNode{}; // zero-init
+    zn->hmap = HNode{};
+
+    // insert into hashtable
+    zn->hmap.hcode = str_hash((uint8_t *)name, len);
+    hm_insert(&zset->hmap, &zn->hmap);
+
+    // insert into tree
+    avl_insert(&zset->root, &zn->treeNode);
+
+    return true;
+}
+
+// delete a member from both indexes
+static void zset_delete(ZSet *zset, ZNode *zn)
+{
+    // build a lookup key (needed by hm_delete to find the node)
+    ZNode key;
+    key.name = zn->name;
+    key.hmap.hcode = zn->hmap.hcode;
+    hm_delete(&zset->hmap, &key.hmap, &hnode_eq);
+
+    // remove from tree
+    zset->root = avl_del(&zn->treeNode);
+
+    // free
+    delete zn;
+}
+
+// Range / rank
+//  find the first node with (score, name) >= target
+// You want "everyone with score ≥ 100." zset_seekge finds the very first member whose (score, name) is ≥ (100, name).
+static ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len)
+{
+    AVLNode *found = NULL;
+    AVLNode *cur = zset->root;
+
+    while (cur)
+    {
+        // build a fake node for comparison
+        ZNode key;
+        key.score = score;
+        key.name.assign(name, len);
+
+        if (zless(&key.treeNode, cur))
+        {                    // key < cur
+            found = cur;     // cur is >= key → candidate
+            cur = cur->left; // go left to find a closer match
+        }
+        else
+        {                     // key >= cur
+            cur = cur->right; // go right (need bigger)
         }
     }
-    return NULL; // not found
+
+    return found ? container_of(found, ZNode, treeNode) : NULL;
 }
 
-// remove the node that `from` points to. returns the removed node.
-static HNode *h_detach(HTab *htab, HNode **from)
+// walk N positions in the tree from a node
+static ZNode *znode_offset(ZNode *zn, int64_t offset)
 {
-    HNode *node = *from; // the node to remove
-    *from = node->next;  // skip over it in the chain
-    htab->size--;        // one fewer key
-    return node;
+    if (!zn)
+        return NULL;
+    AVLNode *tnode = avl_offset(&zn->treeNode, offset);
+    return tnode ? container_of(tnode, ZNode, treeNode) : NULL;
 }
 
-// compare two nodes by their keys (used in h_lookup)
-static bool entry_eq(HNode *lhs, HNode *rhs)
+// insert a new member or update an existing one's score.
+// returns true if new, false if updated.
+static void out_nil(Buffer *out)
 {
-    Entry *le = container_of(lhs, Entry, node); // get the left half entry
-    Entry *re = container_of(rhs, Entry, node); // get the right half entry
-
-    return le->key == re->key; // compare key
+    buf_append_u8(out, TAG_NIL);
 }
 
-// a resizable hashtable — uses two HTabs during rehashing
-struct HMap
+// write a string response: [TAG_STR][4-byte length][bytes]
+static void out_str(Buffer *out, const char *s, size_t len)
 {
-    HTab newer;             // new table (inserts go here)
-    HTab older;             // old table (being drained during rehash)
-    size_t migrate_pos = 0; // where we are in the migration of older
-};
-
-// begin rehashing: move newer → older, allocate a bigger newer
-static void hm_trigger_rehashing(HMap *hmap)
-{
-    hmap->older = hmap->newer;                        // old new becomes "older"
-    h_init(&hmap->newer, (hmap->newer.mask + 1) * 2); // allocate newer with double size
-    hmap->migrate_pos = 0;                            // start migrating from slot 0
+    buf_append_u8(out, TAG_STR);
+    buf_append_u32(out, (uint32_t)len);
+    buf_append(out, (const uint8_t *)s, len);
 }
 
-// migrate a few entries from older to newer. called on every operation.
-static void hm_help_rehashing(HMap *hmap)
+// write an integer response: [TAG_INT][8-byte int64]
+static void out_int(Buffer *out, int64_t val)
 {
-    if (hmap->older.tab == NULL)
-    {
-        return; // not rehashing
+    buf_append_u8(out, TAG_INT);
+    buf_append_i64(out, val);
+}
+
+// start writing an array. returns a position to patch later.
+static size_t out_arr_begin(Buffer *out)
+{
+    buf_append_u8(out, TAG_ARR);     // tag
+    size_t pos = buf_data_size(out); // remember where count goes
+    buf_append_u32(out, 0);          // reserve 4 bytes for count
+    return pos;                      // caller patches this later
+}
+
+// finish the array: write the actual count
+static void out_arr_end(Buffer *out, size_t pos, uint32_t count)
+{
+    memcpy(buf_data(out) + pos, &count, 4); // patch the count
+}
+
+// write an error response: [TAG_ERR][4-byte code][4-byte len][message]
+static void out_err(Buffer *out, uint32_t code, const char *msg)
+{
+    buf_append_u8(out, TAG_ERR);
+    buf_append_u32(out, code);
+    buf_append_u32(out, (uint32_t)strlen(msg));
+    buf_append(out, (const uint8_t *)msg, strlen(msg));
+}
+
+// Command handlers
+// handle "zadd key score name" — add or update a member
+static void do_zadd(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 4)
+    { // ["zadd", key, score, name]
+        out_err(out, ERR_BAD_ARG, "zadd needs 3 args");
+        return;
     }
+    double score = strtod(cmd[2].c_str(), NULL); // parse score string → double
+    bool added = zset_insert(&g_zset, cmd[3].data(), cmd[3].size(), score);
+    out_int(out, added ? 1 : 0); // 1 = new, 0 = updated
+}
 
-    size_t nwork = 0;
-    while (nwork < k_rehashing_work && hmap->older.size > 0)
+// handle "zscore key name" — reply with the score as a string, or nil
+static void do_zscore(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 3)
+    { // ["zscore", key, name]
+        out_err(out, ERR_BAD_ARG, "zscore needs 2 args");
+        return;
+    }
+    ZNode *zn = zset_lookup(&g_zset, cmd[2].data(), cmd[2].size());
+    if (!zn)
     {
-        // move to the next non-empty slot
-        HNode **from = &hmap->older.tab[hmap->migrate_pos];
-        if (!*from)
+        out_nil(out);
+        return;
+    } // not found → nil
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%g", zn->score); // double → string (compact)
+    out_str(out, buf, strlen(buf));              // reply as string
+}
+
+// handle "zrem key name" — remove a member, reply 1 or 0
+static void do_zrem(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 3)
+    { // ["zrem", key, name]
+        out_err(out, ERR_BAD_ARG, "zrem needs 3 args");
+        return;
+    }
+    ZNode *zn = zset_lookup(&g_zset, cmd[2].data(), cmd[2].size());
+    if (!zn)
+    {
+        out_int(out, 0);
+        return;
+    } // wasn't there
+    zset_delete(&g_zset, zn); // remove from both indexes
+    out_int(out, 1);          // 1 = removed
+}
+
+// handle "zquery key score name offset limit" — range query, reply array
+static void do_zquery(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 6)
+    { // ["zquery", key, score, name, offset, limit]
+        out_err(out, ERR_BAD_ARG, "zquery needs 5 args");
+        return;
+    }
+    double score = strtod(cmd[2].c_str(), NULL);        // starting score
+    const string &name = cmd[3];                        // starting name
+    int64_t offset = strtoll(cmd[4].c_str(), NULL, 10); // skip N
+    int64_t limit = strtoll(cmd[5].c_str(), NULL, 10);  // how many
+
+    // 1. find the starting node
+    ZNode *zn = zset_seekge(&g_zset, score, name.data(), name.size());
+    // 2. skip offset positions
+    zn = znode_offset(zn, offset);
+
+    // 3. walk and emit
+    size_t ctx = out_arr_begin(out); // start array
+    uint32_t n = 0;
+    while (zn && n < (uint32_t)limit)
+    {
+        out_str(out, zn->name.data(), zn->name.size()); // name
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%g", zn->score);
+        out_str(out, buf, strlen(buf)); // score
+        zn = znode_offset(zn, +1);      // next
+        n += 2;                         // 2 elements per member
+    }
+    out_arr_end(out, ctx, n); // patch element count
+}
+
+static HMap g_data; // global key-value store
+
+// process a parsed command and fill the response
+// static void do_request(vector<string> &cmd, Response &out)
+// {
+//     if (cmd.size() == 3 && cmd[0] == "set")
+//     {
+//         // set key value
+//         g_data[cmd[1]].swap(cmd[2]); // we could used cmd[1] = cmd[2] , that will copy but we swap the pointers
+//     }
+//     else if (cmd.size() == 2 && cmd[0] == "get")
+//     {
+//         // get key
+//         auto it = g_data.find(cmd[1]);
+//         if (it == g_data.end())
+//         {
+//             out.status = RES_NX; // not found
+//             return;
+//         }
+//         const string &val = it->second;
+//         out.data.assign(val.begin(), val.end());
+//     }
+//     else if (cmd.size() == 2 && cmd[0] == "del")
+//     {
+//         // del key
+//         size_t n = g_data.erase(cmd[1]);
+//         out.data.assign((uint8_t *)&n, (uint8_t *)&n + 8); // 8-byte size_t
+//     }
+//     else
+//     {
+//         out.status = RES_ERR; // unknown command
+//     }
+// }
+// write a nil response (just the tag)
+
+// rewriteing the do_request functions with our custom hashTable
+// process a parsed command and fill the response
+static void do_request(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() == 3 && cmd[0] == "set")
+    {
+        Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
+        if (node)
         {
-            hmap->migrate_pos++; // empty slot — skip it
-            continue;
+            // key exists — update value in place
+            Entry *ent = container_of(node, Entry, node);
+            ent->val.swap(cmd[2]);
         }
-
-        // move one node from older to newer
-        HNode *moved = h_detach(&hmap->older, from);
-        h_insert(&hmap->newer, moved);
-        nwork++;
-    }
-
-    // if older is empty, free it
-    if (hmap->older.size == 0 && hmap->older.tab)
-    {
-        free(hmap->older.tab);
-        hmap->older.tab = NULL;
-    }
-}
-
-// find a node by key, checking both tables during rehashing
-static HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *))
-{
-    hm_help_rehashing(hmap); // do a little migration
-
-    HNode **from = h_lookup(&hmap->newer, key, eq); // search newer first
-    if (!from)
-    {                                           // not in newer?
-        from = h_lookup(&hmap->older, key, eq); // try older
-    }
-    return from ? *from : NULL; // dereference or return NULL
-}
-
-// insert a node. triggers rehashing when the table gets too full.
-static void hm_insert(HMap *hmap, HNode *node)
-{
-    if (!hmap->newer.tab)
-    {                            // first insert? initialize the table
-        h_init(&hmap->newer, 4); // start with 4 slots
-    }
-
-    h_insert(&hmap->newer, node); // always insert into newer
-
-    if (!hmap->older.tab)
-    { // not already rehashing?
-        size_t threshold = (hmap->newer.mask + 1) * k_max_load_factor;
-        if (hmap->newer.size >= threshold)
+        else
         {
-            hm_trigger_rehashing(hmap); // time to grow
+            // new key — create and insert
+            Entry *ent = new Entry();
+            ent->key.swap(key.key);
+            ent->val.swap(cmd[2]);
+            ent->node.hcode = key.node.hcode;
+            hm_insert(&g_data, &ent->node);
         }
+        out_nil(out); // set returns nil
     }
-
-    hm_help_rehashing(hmap); // do a little migration
-}
-
-// remove a node. searches both tables during rehashing.
-static HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *))
-{
-    hm_help_rehashing(hmap); // do a little migration
-
-    HNode **from = h_lookup(&hmap->newer, key, eq); // try newer
-    if (from)
+    else if (cmd.size() == 2 && cmd[0] == "get")
     {
-        return h_detach(&hmap->newer, from); // found in newer — detach
-    }
+        Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-    from = h_lookup(&hmap->older, key, eq); // try older
-    if (from)
+        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
+        if (!node)
+        {
+            out_nil(out); // not found - nil
+            return;
+        }
+        Entry *ent = container_of(node, Entry, node);
+        out_str(out, ent->val.data(), ent->val.size()); // found a string
+    }
+    else if (cmd.size() == 2 && cmd[0] == "del")
     {
-        return h_detach(&hmap->older, from); // found in older — detach
-    }
+        Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-    return NULL; // not found in either
+        HNode *node = hm_delete(&g_data, &key.node, &entry_eq);
+        if (!node)
+        {
+            out_int(out, 0); // nothing deleted
+            return;
+        }
+        Entry *ent = container_of(node, Entry, node);
+        delete ent;
+        out_int(out, 1); // one key deleted
+    }
+    else if (cmd[0] == "zadd" && cmd.size() == 4)
+    {
+        do_zadd(cmd, out);
+    }
+    else if (cmd[0] == "zscore" && cmd.size() == 3)
+    {
+        do_zscore(cmd, out);
+    }
+    else if (cmd[0] == "zrem" && cmd.size() == 3)
+    {
+        do_zrem(cmd, out);
+    }
+    else if (cmd[0] == "zquery" && cmd.size() == 6)
+    {
+        do_zquery(cmd, out);
+    }
+    else
+    {
+        out_err(out, ERR_UNKNOWN, "unkown command");
+    }
 }
 
 // per Client state , remembered across event loop iterations
@@ -762,150 +1169,6 @@ static int32_t parse_req(const uint8_t *data, size_t size, vector<string> &out)
 
 // temporary key-value store — replaced with a real hashtable later
 // static map<string, string> g_data;
-
-// the global key-value store (our custom hashtable)
-static HMap g_data;
-
-// process a parsed command and fill the response
-// static void do_request(vector<string> &cmd, Response &out)
-// {
-//     if (cmd.size() == 3 && cmd[0] == "set")
-//     {
-//         // set key value
-//         g_data[cmd[1]].swap(cmd[2]); // we could used cmd[1] = cmd[2] , that will copy but we swap the pointers
-//     }
-//     else if (cmd.size() == 2 && cmd[0] == "get")
-//     {
-//         // get key
-//         auto it = g_data.find(cmd[1]);
-//         if (it == g_data.end())
-//         {
-//             out.status = RES_NX; // not found
-//             return;
-//         }
-//         const string &val = it->second;
-//         out.data.assign(val.begin(), val.end());
-//     }
-//     else if (cmd.size() == 2 && cmd[0] == "del")
-//     {
-//         // del key
-//         size_t n = g_data.erase(cmd[1]);
-//         out.data.assign((uint8_t *)&n, (uint8_t *)&n + 8); // 8-byte size_t
-//     }
-//     else
-//     {
-//         out.status = RES_ERR; // unknown command
-//     }
-// }
-// write a nil response (just the tag)
-static void out_nil(Buffer *out)
-{
-    buf_append_u8(out, TAG_NIL);
-}
-
-// write a string response: [TAG_STR][4-byte length][bytes]
-static void out_str(Buffer *out, const char *s, size_t len)
-{
-    buf_append_u8(out, TAG_STR);
-    buf_append_u32(out, (uint32_t)len);
-    buf_append(out, (const uint8_t *)s, len);
-}
-
-// write an integer response: [TAG_INT][8-byte int64]
-static void out_int(Buffer *out, int64_t val)
-{
-    buf_append_u8(out, TAG_INT);
-    buf_append_i64(out, val);
-}
-
-// start writing an array. returns a position to patch later.
-static size_t out_arr_begin(Buffer *out)
-{
-    buf_append_u8(out, TAG_ARR);     // tag
-    size_t pos = buf_data_size(out); // remember where count goes
-    buf_append_u32(out, 0);          // reserve 4 bytes for count
-    return pos;                      // caller patches this later
-}
-
-// finish the array: write the actual count
-static void out_arr_end(Buffer *out, size_t pos, uint32_t count)
-{
-    memcpy(buf_data(out) + pos, &count, 4); // patch the count
-}
-
-// write an error response: [TAG_ERR][4-byte code][4-byte len][message]
-static void out_err(Buffer *out, uint32_t code, const char *msg)
-{
-    buf_append_u8(out, TAG_ERR);
-    buf_append_u32(out, code);
-    buf_append_u32(out, (uint32_t)strlen(msg));
-    buf_append(out, (const uint8_t *)msg, strlen(msg));
-}
-
-// rewriteing the do_request functions with our custom hashTable
-// process a parsed command and fill the response
-static void do_request(vector<string> &cmd, Buffer *out)
-{
-    if (cmd.size() == 3 && cmd[0] == "set")
-    {
-        Entry key;
-        key.key.swap(cmd[1]);
-        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
-        if (node)
-        {
-            // key exists — update value in place
-            Entry *ent = container_of(node, Entry, node);
-            ent->val.swap(cmd[2]);
-        }
-        else
-        {
-            // new key — create and insert
-            Entry *ent = new Entry();
-            ent->key.swap(key.key);
-            ent->val.swap(cmd[2]);
-            ent->node.hcode = key.node.hcode;
-            hm_insert(&g_data, &ent->node);
-        }
-        out_nil(out); // set returns nil
-    }
-    else if (cmd.size() == 2 && cmd[0] == "get")
-    {
-        Entry key;
-        key.key.swap(cmd[1]);
-        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
-        if (!node)
-        {
-            out_nil(out); // not found - nil
-            return;
-        }
-        Entry *ent = container_of(node, Entry, node);
-        out_str(out, ent->val.data(), ent->val.size()); // found a string
-    }
-    else if (cmd.size() == 2 && cmd[0] == "del")
-    {
-        Entry key;
-        key.key.swap(cmd[1]);
-        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-        HNode *node = hm_delete(&g_data, &key.node, &entry_eq);
-        if (!node)
-        {
-            out_int(out, 0); // nothing deleted
-            return;
-        }
-        Entry *ent = container_of(node, Entry, node);
-        delete ent;
-        out_int(out, 1); // one key deleted
-    }
-    else
-    {
-        out_err(out, ERR_UNKNOWN, "unkown command");
-    }
-}
 
 // reserve 4bytes for the message header. remember where they are
 static size_t response_begin(Buffer *out)

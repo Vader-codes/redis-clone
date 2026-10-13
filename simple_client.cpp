@@ -118,6 +118,39 @@ static int32_t read_res(int fd)
         memcpy(&val, body.data() + 1, 8); // next 8 bytes = int64
         printf("(int) %lld\n", (long long)val);
     }
+    else if (tag == 5)
+    {                                     // ARR — this is an array
+        uint32_t cnt = 0;                 // will hold element count or string count
+        memcpy(&cnt, body.data() + 1, 4); // 4 bytes after tag = count
+        printf("(array of %u)\n", cnt);   // report
+
+        // walk elements: each starts with tag, then depends
+        const uint8_t *cur = body.data() + 5;   // first element starts at byte 5
+        const uint8_t *end = body.data() + len; // where the array body ends
+        for (uint32_t i = 0; i < cnt && cur < end; i++)
+        {
+            uint8_t etag = cur[0]; // read this element's tag
+            if (etag == 2)
+            {                              // string element
+                uint32_t elen = 0;         // element's length
+                memcpy(&elen, cur + 1, 4); // 4 bytes after tag
+                printf("  [%u] str: %.*s\n", i, (int)elen, cur + 5);
+                cur += 5 + elen; // advance: 1 tag + 4 len + body
+            }
+            else if (etag == 3)
+            { // int element
+                int64_t ev = 0;
+                memcpy(&ev, cur + 1, 8); // 8 bytes after tag
+                printf("  [%u] int: %lld\n", i, (long long)ev);
+                cur += 9; // advance: 1 tag + 8 value
+            }
+            else
+            {
+                printf("  [%u] unknown tag %d\n", i, etag);
+                break;
+            }
+        }
+    }
     else if (tag == 1)
     { // TAG_ERR
         uint32_t code = 0;
@@ -164,6 +197,30 @@ int main()
 
     send_req(fd, {"get", "name"}); // look up deleted key
     read_res(fd);                  // expect: not found
+
+    // add members
+    send_req(fd, {"zadd", "scores", "100", "alice"});
+    read_res(fd);
+    send_req(fd, {"zadd", "scores", "90", "bob"});
+    read_res(fd);
+    send_req(fd, {"zadd", "scores", "110", "carol"});
+    read_res(fd);
+    send_req(fd, {"zadd", "scores", "80", "dave"});
+    read_res(fd);
+
+    // lookup one
+    send_req(fd, {"zscore", "scores", "bob"});
+    read_res(fd);
+
+    // range query
+    send_req(fd, {"zquery", "scores", "0", "", "0", "6"});
+    read_res(fd);
+
+    // delete one, then re-query
+    send_req(fd, {"zrem", "scores", "alice"});
+    read_res(fd);
+    send_req(fd, {"zquery", "scores", "0", "", "0", "6"});
+    read_res(fd);
 
     close(fd); // hung up
     return 0;
