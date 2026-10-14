@@ -11,6 +11,7 @@
 #include <string>
 #include <assert.h>
 #include <stddef.h> // for offsetof
+#include <time.h>   // for clock_gettime, timespec
 using namespace std;
 
 // maximun message our server can receive (32MB)
@@ -161,6 +162,18 @@ static uint64_t str_hash(const uint8_t *data, size_t len)
         h = (h + data[i]) * 16777619; // FNV prime
     }
     return h;
+}
+
+// get the current monotonic time in milliseconds
+// Wall clock = "what time is it in the world?"(can change)
+//  Monotonic = "how many seconds since I started counting?"(never changes, only increases) static uint64_t
+static uint64_t get_monotonic_msec()
+{
+    // timespec is a struct with two fields:1 tv_sec — whole seconds,2.tv_nsec — nanoseconds(0 to 999, 999, 999)
+    struct timespec tv = {0, 0};
+
+    clock_gettime(CLOCK_MONOTONIC, &tv); // fill tv with current time
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000000;
 }
 
 // intrusive hashtable node - embedded inside the data it indexes
@@ -632,6 +645,44 @@ static AVLNode *avl_offset(AVLNode *node, int64_t offset)
     return node;
 }
 
+// intrusive doubly-linked list node
+struct DList
+{
+    DList *prev = NULL;
+    DList *next = NULL;
+};
+
+// initialize a list head — points to itself (empty list)
+static void dlist_init(DList *node)
+{
+    node->prev = node->next = node;
+}
+
+// is the list empty? (only the dummy head is present)
+static bool dlist_empty(DList *node)
+{
+    return node->next == node; // pointing to itself
+}
+
+// unlink a node from its list
+static void dlist_detach(DList *node)
+{
+    DList *prev = node->prev;
+    DList *next = node->next;
+    prev->next = next;
+    next->prev = prev;
+}
+
+// insert `rookie` before `target`
+static void dlist_insert_before(DList *target, DList *rookie)
+{
+    DList *prev = target->prev;
+    prev->next = rookie;
+    rookie->prev = prev;
+    rookie->next = target;
+    target->prev = rookie;
+}
+
 // one member of a sorted set: score + name, indexed two ways
 struct ZNode
 {
@@ -649,6 +700,12 @@ struct ZSet
 };
 
 static ZSet g_zset; // the global sorted set
+
+// timeout for idle connections (in milliseconds)
+const int64_t k_idle_timeout_ms = 5 * 1000; // 5 seconds
+
+// global state for timers
+static DList g_idle_list; // dummy head; the list of idle connections
 
 // compare two ZNodes by (score, name) — tree ordering
 static bool zless(AVLNode *lhs, AVLNode *rhs)
@@ -1080,6 +1137,9 @@ struct Conn
     Buffer incoming;         // bytes received, not yet processed one byte per element
                              // was: vector<uint8_t> outgoing
     Buffer outgoing;         // bytes to send back /
+
+    uint64_t last_active_ms = 0; // when this client was last did I/O
+    DList idle_node;             // this is client's node in the idle list
 };
 
 // print error and exit
@@ -1187,6 +1247,53 @@ static void response_end(Buffer *out, size_t header_pros)
     memcpy(buf_data(out) + header_pros, &len, 4);
 }
 
+// how many milliseconds until the nearest timer expires?
+// returns -1 if there are no timers (wait forever)
+static int32_t next_timer_ms()
+{
+    if (dlist_empty(&g_idle_list))
+    {
+        return -1; // no timers → wait forever
+    }
+
+    uint64_t now_ms = get_monotonic_msec();
+
+    // front of the list = the client that's been idle the longest
+    Conn *conn = container_of(g_idle_list.next, Conn, idle_node);
+    uint64_t expire_at = conn->last_active_ms + k_idle_timeout_ms;
+
+    if (expire_at <= now_ms)
+    {
+        return 0; // already expired → don't wait
+    }
+    return (int32_t)(expire_at - now_ms);
+}
+
+// close any connections whose idle timeout has expired
+static void process_timers()
+{
+    uint64_t now_ms = get_monotonic_msec();
+
+    while (!dlist_empty(&g_idle_list))
+    {
+        // front of the list = longest idle
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_node);
+        uint64_t expire_at = conn->last_active_ms + k_idle_timeout_ms;
+
+        if (expire_at > now_ms)
+        {
+            break; // front not expired yet → done
+        }
+
+        printf("client %d timed out\n", conn->fd);
+        conn->want_close = true; // let the cleanup pass handle it
+
+        // move to next — we can't just look at head again, we'd loop forever
+        // so we temporarily detach this conn from the list
+        dlist_detach(&conn->idle_node);
+    }
+}
+
 // try to parse one request form conn->incoming
 //  returns true if a request was parsed , false if we need more data
 static bool try_one_request(Conn *conn)
@@ -1284,9 +1391,12 @@ int main()
     // so accept() never blocks; it returns -1 + EAGAIN if no client is listening
 
     make_nonblocking(fd);
-    // map from fd to Conn pointer, indexed by fd
-    // fd2conn[4] = the Conn for fd 4
-    // fd2conn[7] = NULL means fd 7 has no Conn (unused)
+    dlist_init(&g_idle_list); // empty list of idle connections
+
+    // {
+    // // map from fd to Conn pointer, indexed by fd
+    // // fd2conn[4] = the Conn for fd 4
+    // // fd2conn[7] = NULL means fd 7 has no Conn (unused)}
     vector<Conn *> fd2conn; // which sockets ready
 
     // -- event loop --
@@ -1323,9 +1433,11 @@ int main()
 
         // wait for readiness - this blocks until at least one fd is ready
         // -1 timeout blocksout forever until something is ready
-        int nready = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        int32_t timeout_ms = next_timer_ms();
+        int nready = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (nready < 0)
             die("poll()");
+        process_timers(); // close any expired idle connections
 
         // handle the listening fd-
         // poll_args[0] is the listening fd
@@ -1344,7 +1456,9 @@ int main()
             // create a Conn for this client
             Conn *conn = new Conn();
             conn->fd = connfd;
-            conn->want_read = true; // we want to read the first request
+            conn->want_read = true;                              // we want to read the first request
+            conn->last_active_ms = get_monotonic_msec();         // start the timer
+            dlist_insert_before(&g_idle_list, &conn->idle_node); // add to back of list
 
             // store it in fd2Conn, indexed by fd
             // grow the array if needed
@@ -1362,6 +1476,10 @@ int main()
         {
             uint32_t ready = poll_args[i].revents;
             Conn *conn = fd2conn[poll_args[i].fd];
+            // update idle timer: move this client to the back
+            conn->last_active_ms = get_monotonic_msec();
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_idle_list, &conn->idle_node);
 
             if (ready & POLLIN)
             {
@@ -1380,17 +1498,17 @@ int main()
                 buf_append(&conn->incoming, buf, rv);
                 printf("client %d sent %zd bytes (total: %zu)\n", conn->fd, rv, buf_data_size(&conn->incoming));
 
-                // try to parse as many complete requests as possible
-                while (try_one_request(conn))
-                {
-                    // keep going while there are complete requests
-                }
-                // // if we produced a response , switch to want -write
-                // if (conn->outgoing.size() > 0)
-                // {
-                //     conn->want_read = false;
-                //     conn->want_write = true;
-                // }
+                //   {  // try to parse as many complete requests as possible
+                //     while (try_one_request(conn))
+                //     {
+                //         // keep going while there are complete requests
+                //     }
+                //     // // if we produced a response , switch to want -write
+                //     // if (conn->outgoing.size() > 0)
+                //     // {
+                //     //     conn->want_read = false;
+                //     //     conn->want_write = true;
+                //     // }}
 
                 // if we produced a response, try to write it now (optimistic)
                 if (buf_data_size(&conn->outgoing) > 0)
@@ -1469,8 +1587,9 @@ int main()
             {
                 close(conn->fd);
                 fd2conn[conn->fd] = NULL;
-                free_buffer(&conn->incoming); // free incoming buffer
-                free_buffer(&conn->outgoing); // free outggoing buffer
+                free_buffer(&conn->incoming);   // free incoming buffer
+                free_buffer(&conn->outgoing);   // free outggoing buffer
+                dlist_detach(&conn->idle_node); // remove from the idle list
                 delete conn;
                 printf("client cleaned up \n");
             }
