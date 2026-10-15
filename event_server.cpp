@@ -844,7 +844,7 @@ struct ZSet
 static ZSet g_zset; // the global sorted set
 
 // timeout for idle connections (in milliseconds)
-const int64_t k_idle_timeout_ms = 5 * 1000; // 5 seconds
+const int64_t k_idle_timeout_ms = 5 * 60 * 1000; // 5 minutes
 
 // global state for timers
 static DList g_idle_list; // dummy head; the list of idle connections

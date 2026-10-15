@@ -6,6 +6,8 @@
 #include <string.h>     // strlen
 #include <string>
 #include <vector>
+#include <iostream> // cin, cout
+#include <sstream>  // istringstream
 using namespace std;
 
 static void die(const char *msg)
@@ -185,64 +187,25 @@ int main()
     if (rv < 0)
         die("connect()");
 
-    // send some commannds and read responses
-    send_req(fd, {"set", "name", "bipin"}); // stores name = bipin
-    read_res(fd);                           // expect : OK, no data
+    // read lines from stdin
+    string line;
+    while (getline(cin, line))
+    {
+        if (line.empty())
+            continue;
 
-    send_req(fd, {"get", "name"}); // look up name
-    read_res(fd);                  // expect: OK, data=Rishi
+        // split the line by spaces into words
+        vector<string> cmd;
+        string word;
+        istringstream iss(line);
+        while (iss >> word)
+            cmd.push_back(word);
 
-    send_req(fd, {"del", "name"}); // delete name
-    read_res(fd);                  // expect: OK, data=<binary 1>
-
-    send_req(fd, {"get", "name"}); // look up deleted key
-    read_res(fd);                  // expect: not found
-
-    // add members
-    send_req(fd, {"zadd", "scores", "100", "alice"});
-    read_res(fd);
-    send_req(fd, {"zadd", "scores", "90", "bob"});
-    read_res(fd);
-    send_req(fd, {"zadd", "scores", "110", "carol"});
-    read_res(fd);
-    send_req(fd, {"zadd", "scores", "80", "dave"});
-    read_res(fd);
-
-    // lookup one
-    send_req(fd, {"zscore", "scores", "bob"});
-    read_res(fd);
-
-    // range query
-    send_req(fd, {"zquery", "scores", "0", "", "0", "6"});
-    read_res(fd);
-
-    // delete one, then re-query
-    send_req(fd, {"zrem", "scores", "alice"});
-    read_res(fd);
-    send_req(fd, {"zquery", "scores", "0", "", "0", "6"});
-    read_res(fd);
-
-    // TTL tests
-    send_req(fd, {"set", "session", "abc123"});
-    read_res(fd); // set a key
-    send_req(fd, {"expire", "session", "2000"});
-    read_res(fd); // TTL 2 seconds
-    send_req(fd, {"ttl", "session"});
-    read_res(fd); // remaining TTL
-    send_req(fd, {"persist", "session"});
-    read_res(fd); // remove TTL
-    send_req(fd, {"ttl", "session"});
-    read_res(fd); // should be -1
-
-    // let a key expire
-    send_req(fd, {"set", "temp", "gone"});
-    read_res(fd);
-    send_req(fd, {"expire", "temp", "1500"});
-    read_res(fd); // 1.5s TTL
-    sleep(2);     // wait it out
-    send_req(fd, {"get", "temp"});
-    read_res(fd); // should be nil
-
+        // send it as a request
+        send_req(fd, cmd);
+        // read and print the response
+        read_res(fd);
+    }
     close(fd); // hung up
     return 0;
 }
