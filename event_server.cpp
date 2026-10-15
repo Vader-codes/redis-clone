@@ -1395,6 +1395,7 @@ static void process_timers()
         printf("client %d timed out\n", conn->fd); // log it
         conn->want_close = true;                   // mark for close
         dlist_detach(&conn->idle_node);            // unlink from list
+        dlist_init(&conn->idle_node);              // node points to itself, so a second detach is a no-op
     }
 
     // 2. TTL'd keys
