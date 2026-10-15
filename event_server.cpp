@@ -12,6 +12,8 @@
 #include <assert.h>
 #include <stddef.h> // for offsetof
 #include <time.h>   // for clock_gettime, timespec
+#include <pthread.h>
+#include <deque>
 using namespace std;
 
 // maximun message our server can receive (32MB)
@@ -1019,6 +1021,78 @@ static ZNode *znode_offset(ZNode *zn, int64_t offset)
     return tnode ? container_of(tnode, ZNode, treeNode) : NULL;
 }
 
+// one unit of work for a worker thread
+struct Work
+{
+    void (*f)(void *) = NULL; // function to call
+    void *arg = NULL;         // argument to pass
+};
+
+// a pool of worker threads + a shared task queue
+struct ThreadPool
+{
+    vector<pthread_t> threads; // handles for the worker threads
+    deque<Work> queue;         // pending tasks (FIFO)
+    pthread_mutex_t mu;        // protects the queue
+    pthread_cond_t not_empty;  // signaled when a task arrives
+};
+
+// what each worker thread runs — an infinite loop pulling tasks
+static void *worker(void *arg)
+{
+    ThreadPool *tp = (ThreadPool *)arg; // cast the argument
+
+    while (true)
+    {
+        pthread_mutex_lock(&tp->mu); // enter the critical section
+
+        // wait while the queue is empty
+        while (tp->queue.empty())
+        {
+            pthread_cond_wait(&tp->not_empty, &tp->mu); // sleep, release mutex
+        }
+
+        // grab the next task
+        Work w = tp->queue.front(); // copy the front task
+        tp->queue.pop_front();      // remove it
+
+        pthread_mutex_unlock(&tp->mu); // leave the critical section
+
+        // run the task OUTSIDE the lock (parallel work)
+        w.f(w.arg);
+    }
+    return NULL;
+}
+
+// producer side: add a task to the pool's queue
+static void thread_pool_queue(ThreadPool *tp, void (*f)(void *), void *arg)
+{
+    pthread_mutex_lock(&tp->mu); // enter the critical section
+
+    tp->queue.push_back({f, arg});       // append the task
+    pthread_cond_signal(&tp->not_empty); // wake one sleeping worker
+
+    pthread_mutex_unlock(&tp->mu); // leave the critical section
+}
+
+// start N worker threads
+static void thread_pool_init(ThreadPool *tp, size_t num_threads)
+{
+    pthread_mutex_init(&tp->mu, NULL);       // initialize the mutex
+    pthread_cond_init(&tp->not_empty, NULL); // initialize the condvar
+
+    tp->threads.resize(num_threads); // room for N threads
+
+    for (size_t i = 0; i < num_threads; i++)
+    {
+        int rv = pthread_create(&tp->threads[i], // handle storage
+                                NULL,            // attributes
+                                &worker,         // function to run
+                                tp);             // argument (the pool)
+        assert(rv == 0);                         // create must succeed
+    }
+}
+
 // insert a new member or update an existing one's score.
 // returns true if new, false if updated.
 static void out_nil(Buffer *out)
@@ -1151,6 +1225,8 @@ static void do_zquery(vector<string> &cmd, Buffer *out)
 }
 
 static HMap g_data; // global key-value store
+
+static ThreadPool g_thread_pool; // global thread pool
 
 // per Client state , remembered across event loop iterations
 struct Conn
@@ -1574,6 +1650,12 @@ static bool try_one_request(Conn *conn)
     return true;
 }
 
+// demo task: prints when a worker runs it
+static void hello_task(void *arg)
+{
+    printf("worker ran a demo task!\n");
+}
+
 int main()
 {
     // skeleton of our event loop
@@ -1611,12 +1693,10 @@ int main()
     // so accept() never blocks; it returns -1 + EAGAIN if no client is listening
 
     make_nonblocking(fd);
-    dlist_init(&g_idle_list); // empty list of idle connections
+    dlist_init(&g_idle_list);                             // empty list of idle connections
+    thread_pool_init(&g_thread_pool, 4);                  // 4 worker threads
+    thread_pool_queue(&g_thread_pool, &hello_task, NULL); // fire a demo task
 
-    // {
-    // // map from fd to Conn pointer, indexed by fd
-    // // fd2conn[4] = the Conn for fd 4
-    // // fd2conn[7] = NULL means fd 7 has no Conn (unused)}
     vector<Conn *> fd2conn; // which sockets ready
 
     // -- event loop --
