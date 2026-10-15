@@ -191,13 +191,153 @@ struct HTab
     size_t size = 0;    // numbers of keys currently stored
 };
 
+// one item in the TTL heap
+struct HeapItem
+{
+    uint64_t val = 0;   // expiration timestamp (ms)
+    size_t *ref = NULL; // points to Entry::heap_idx
+};
+
+// left child of index i
+static size_t heap_left(size_t i) { return i * 2 + 1; }
+
+// right child of index i
+static size_t heap_right(size_t i) { return i * 2 + 2; }
+
+// parent of index i
+static size_t heap_parent(size_t i) { return (i + 1) / 2 - 1; }
+
+// move the item at `pos` up until the heap property is restored.
+// also updates each moved item's ref.
+static void heap_up(vector<HeapItem> &heap, size_t pos)
+{
+    HeapItem item = heap[pos]; // save the item we're moving
+    while (pos > 0 && heap[heap_parent(pos)].val > item.val)
+    { // parent is bigger?
+        // move parent down
+        heap[pos] = heap[heap_parent(pos)];
+        *heap[pos].ref = pos; // update the parent's entry
+        pos = heap_parent(pos);
+    }
+    heap[pos] = item;     // place our item
+    *heap[pos].ref = pos; // update our item's entry
+}
+
+// move the item at `pos` down until the heap property is restored.
+static void heap_down(vector<HeapItem> &heap, size_t pos)
+{
+    HeapItem item = heap[pos];
+    size_t size = heap.size();
+    while (true)
+    {
+        size_t l = heap_left(pos);
+        size_t r = heap_right(pos);
+        size_t smallest = pos; // find the smallest among parent and children
+        uint64_t min_val = item.val;
+        if (l < size && heap[l].val < min_val)
+        {
+            smallest = l;
+            min_val = heap[l].val;
+        }
+        if (r < size && heap[r].val < min_val)
+        {
+            smallest = r;
+        }
+        if (smallest == pos)
+            break; // parent is smallest → done
+
+        // move the smallest child up
+        heap[pos] = heap[smallest];
+        *heap[pos].ref = pos;
+        pos = smallest;
+    }
+    heap[pos] = item;
+    *heap[pos].ref = pos;
+}
+
+// fix the heap after the item at `pos` changed its value (decide up or down)
+static void heap_update(vector<HeapItem> &heap, size_t pos)
+{
+    // if parent is bigger than us → bubble up
+    // otherwise → sink down
+    if (pos > 0 && heap[heap_parent(pos)].val > heap[pos].val)
+    {
+        heap_up(heap, pos);
+    }
+    else
+    {
+        heap_down(heap, pos);
+    }
+}
+
+// insert a new item, or update an existing one at `pos`.  (insert or update)
+static void heap_upsert(vector<HeapItem> &heap, size_t pos, HeapItem item)
+{
+    if (pos < heap.size())
+    {
+        heap[pos] = item; // update existing slot
+    }
+    else
+    {
+        pos = heap.size(); // append new item
+        heap.push_back(item);
+    }
+    heap_update(heap, pos); // fix heap property
+}
+
+// remove the item at `pos` from the heap ( remove from the middle)
+static void heap_delete(vector<HeapItem> &heap, size_t pos)
+{
+    // move the last item into `pos`'s slot
+    heap[pos] = heap.back();
+    heap.pop_back();
+
+    // fix the heap property at `pos` (if we didn't just remove the last)
+    if (pos < heap.size())
+    {
+        heap_update(heap, pos);
+    }
+}
+
+static vector<HeapItem> g_ttl_heap; // min-heap of expiring entries
+
 // one key-value pair with an embedded hashtable node
 struct Entry
 {
-    HNode node; // intrusive node (must be first for cleaner code)
-    string key; // the key
-    string val; // the value
+    HNode node;           // intrusive node (must be first for cleaner code)
+    string key;           // the key
+    string val;           // the value
+    size_t heap_idx = -1; // index in TTL heap; -1 = no TTL
 };
+
+// set a TTL on an entry, or remove the TTL if ttl_ms is negative (set or remove a key's TTL)
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms)
+{
+    if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) // the entry has a TTL right now and caller wannts to delete it
+    {
+        // remove the TTL
+        heap_delete(g_ttl_heap, ent->heap_idx);
+        ent->heap_idx = -1;
+    }
+    else if (ttl_ms >= 0)
+    {
+        // set or update the TTL
+        uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+        HeapItem item = {expire_at, &ent->heap_idx};
+        heap_upsert(g_ttl_heap, ent->heap_idx, item);
+    }
+}
+
+// free an entry: remove its TTL first, then delete
+static void entry_del(Entry *ent)
+{
+    if (ent->heap_idx != (size_t)-1)
+    {                                           // has a TTL?
+        heap_delete(g_ttl_heap, ent->heap_idx); // remove from heap
+        ent->heap_idx = -1;                     // mark as no TTL
+    }
+    delete ent; // free the entry
+}
 
 // a resizable hashtable — uses two HTabs during rehashing
 struct HMap
@@ -1012,120 +1152,6 @@ static void do_zquery(vector<string> &cmd, Buffer *out)
 
 static HMap g_data; // global key-value store
 
-// process a parsed command and fill the response
-// static void do_request(vector<string> &cmd, Response &out)
-// {
-//     if (cmd.size() == 3 && cmd[0] == "set")
-//     {
-//         // set key value
-//         g_data[cmd[1]].swap(cmd[2]); // we could used cmd[1] = cmd[2] , that will copy but we swap the pointers
-//     }
-//     else if (cmd.size() == 2 && cmd[0] == "get")
-//     {
-//         // get key
-//         auto it = g_data.find(cmd[1]);
-//         if (it == g_data.end())
-//         {
-//             out.status = RES_NX; // not found
-//             return;
-//         }
-//         const string &val = it->second;
-//         out.data.assign(val.begin(), val.end());
-//     }
-//     else if (cmd.size() == 2 && cmd[0] == "del")
-//     {
-//         // del key
-//         size_t n = g_data.erase(cmd[1]);
-//         out.data.assign((uint8_t *)&n, (uint8_t *)&n + 8); // 8-byte size_t
-//     }
-//     else
-//     {
-//         out.status = RES_ERR; // unknown command
-//     }
-// }
-// write a nil response (just the tag)
-
-// rewriteing the do_request functions with our custom hashTable
-// process a parsed command and fill the response
-static void do_request(vector<string> &cmd, Buffer *out)
-{
-    if (cmd.size() == 3 && cmd[0] == "set")
-    {
-        Entry key;
-        key.key.swap(cmd[1]);
-        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
-        if (node)
-        {
-            // key exists — update value in place
-            Entry *ent = container_of(node, Entry, node);
-            ent->val.swap(cmd[2]);
-        }
-        else
-        {
-            // new key — create and insert
-            Entry *ent = new Entry();
-            ent->key.swap(key.key);
-            ent->val.swap(cmd[2]);
-            ent->node.hcode = key.node.hcode;
-            hm_insert(&g_data, &ent->node);
-        }
-        out_nil(out); // set returns nil
-    }
-    else if (cmd.size() == 2 && cmd[0] == "get")
-    {
-        Entry key;
-        key.key.swap(cmd[1]);
-        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
-        if (!node)
-        {
-            out_nil(out); // not found - nil
-            return;
-        }
-        Entry *ent = container_of(node, Entry, node);
-        out_str(out, ent->val.data(), ent->val.size()); // found a string
-    }
-    else if (cmd.size() == 2 && cmd[0] == "del")
-    {
-        Entry key;
-        key.key.swap(cmd[1]);
-        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-        HNode *node = hm_delete(&g_data, &key.node, &entry_eq);
-        if (!node)
-        {
-            out_int(out, 0); // nothing deleted
-            return;
-        }
-        Entry *ent = container_of(node, Entry, node);
-        delete ent;
-        out_int(out, 1); // one key deleted
-    }
-    else if (cmd[0] == "zadd" && cmd.size() == 4)
-    {
-        do_zadd(cmd, out);
-    }
-    else if (cmd[0] == "zscore" && cmd.size() == 3)
-    {
-        do_zscore(cmd, out);
-    }
-    else if (cmd[0] == "zrem" && cmd.size() == 3)
-    {
-        do_zrem(cmd, out);
-    }
-    else if (cmd[0] == "zquery" && cmd.size() == 6)
-    {
-        do_zquery(cmd, out);
-    }
-    else
-    {
-        out_err(out, ERR_UNKNOWN, "unkown command");
-    }
-}
-
 // per Client state , remembered across event loop iterations
 struct Conn
 {
@@ -1247,50 +1273,244 @@ static void response_end(Buffer *out, size_t header_pros)
     memcpy(buf_data(out) + header_pros, &len, 4);
 }
 
-// how many milliseconds until the nearest timer expires?
-// returns -1 if there are no timers (wait forever)
+// milliseconds until the nearest timer (idle list or TTL heap).
+// returns -1 if there are no timers.
 static int32_t next_timer_ms()
 {
-    if (dlist_empty(&g_idle_list))
-    {
-        return -1; // no timers → wait forever
-    }
-
     uint64_t now_ms = get_monotonic_msec();
+    uint64_t next_ms = (uint64_t)-1; // "infinity"
 
-    // front of the list = the client that's been idle the longest
-    Conn *conn = container_of(g_idle_list.next, Conn, idle_node);
-    uint64_t expire_at = conn->last_active_ms + k_idle_timeout_ms;
-
-    if (expire_at <= now_ms)
-    {
-        return 0; // already expired → don't wait
+    // 1. nearest idle connection timeout
+    if (!dlist_empty(&g_idle_list))
+    {                                                                 // any idle clients?
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_node); // front of list
+        next_ms = conn->last_active_ms + k_idle_timeout_ms;           // its expire time
     }
-    return (int32_t)(expire_at - now_ms);
+
+    // 2. nearest key expiration
+    if (!g_ttl_heap.empty() && g_ttl_heap[0].val < next_ms)
+    {                                // heap root sooner?
+        next_ms = g_ttl_heap[0].val; // use its time
+    }
+
+    // 3. no timers at all?
+    if (next_ms == (uint64_t)-1)
+        return -1; // nothing to wait for
+
+    // 4. already expired?
+    if (next_ms <= now_ms)
+        return 0; // return now
+
+    return (int32_t)(next_ms - now_ms); // else: ms until then
 }
 
 // close any connections whose idle timeout has expired
 static void process_timers()
 {
-    uint64_t now_ms = get_monotonic_msec();
+    uint64_t now_ms = get_monotonic_msec(); // current time in ms
 
+    // 1. idle connections
     while (!dlist_empty(&g_idle_list))
-    {
-        // front of the list = longest idle
-        Conn *conn = container_of(g_idle_list.next, Conn, idle_node);
-        uint64_t expire_at = conn->last_active_ms + k_idle_timeout_ms;
-
+    {                                                                  // any idle clients?
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_node);  // front client
+        uint64_t expire_at = conn->last_active_ms + k_idle_timeout_ms; // when it expires
         if (expire_at > now_ms)
+            break;                                 // not yet → stop
+        printf("client %d timed out\n", conn->fd); // log it
+        conn->want_close = true;                   // mark for close
+        dlist_detach(&conn->idle_node);            // unlink from list
+    }
+
+    // 2. TTL'd keys
+    while (!g_ttl_heap.empty() && g_ttl_heap[0].val <= now_ms)
+    {                                                                  // heap root expired?
+        Entry *ent = container_of(g_ttl_heap[0].ref, Entry, heap_idx); // get the entry
+        printf("key expired: %s\n", ent->key.c_str());                 // log it
+        hm_delete(&g_data, &ent->node, &entry_eq);                     // unlink from hashtable
+        entry_del(ent);                                                // free the entry
+    }
+}
+
+// parse a string as int64_t. returns true on success.
+static bool str2int(const string &s, int64_t &out)
+{
+    if (s.empty())
+        return false;                    // empty string → fail
+    char *endp = NULL;                   // will point to parse end
+    out = strtoll(s.c_str(), &endp, 10); // parse base-10
+    return endp == s.c_str() + s.size(); // consumed whole string?
+}
+
+// handle "expire key ms" — set a TTL on a key
+static void do_expire(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 3)
+    { // ["expire", key, ttl_ms]
+        out_err(out, ERR_BAD_ARG, "expire needs 2 args");
+        return;
+    }
+    int64_t ttl_ms = 0; // will hold parsed TTL
+    if (!str2int(cmd[2], ttl_ms))
+    { // parse the TTL string
+        out_err(out, ERR_BAD_ARG, "bad ttl value");
+        return;
+    }
+
+    Entry key;                                                            // fake entry for lookup
+    key.key.swap(cmd[1]);                                                 // take the key string
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size()); // hash it
+
+    HNode *node = hm_lookup(&g_data, &key.node, &entry_eq); // find in hashtable
+    if (node)
+    {                                                 // key exists?
+        Entry *ent = container_of(node, Entry, node); // get the Entry
+        entry_set_ttl(ent, ttl_ms);                   // set the TTL
+    }
+    out_int(out, node ? 1 : 0); // 1 = set, 0 = not found
+}
+
+// handle "ttl key" — remaining TTL in ms, -1 if no TTL, -2 if key missing
+static void do_ttl(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 2)
+    { // ["ttl", key]
+        out_err(out, ERR_BAD_ARG, "ttl needs 1 arg");
+        return;
+    }
+    Entry key;            // fake entry for lookup
+    key.key.swap(cmd[1]); // take the key string
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data, &key.node, &entry_eq); // find in hashtable
+    if (!node)
+    { // key missing?
+        out_int(out, -2);
+        return;
+    }
+    Entry *ent = container_of(node, Entry, node); // get the Entry
+    if (ent->heap_idx == (size_t)-1)
+    { // no TTL set?
+        out_int(out, -1);
+        return;
+    }
+    uint64_t expire_at = g_ttl_heap[ent->heap_idx].val;                  // when it expires
+    int64_t remain = (int64_t)expire_at - (int64_t)get_monotonic_msec(); // remaining ms
+    out_int(out, remain > 0 ? remain : 0);                               // clamp negative to 0
+}
+
+// handle "persist key" — remove a key's TTL
+static void do_persist(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() != 2)
+    { // ["persist", key]
+        out_err(out, ERR_BAD_ARG, "persist needs 1 arg");
+        return;
+    }
+    Entry key;            // fake entry for lookup
+    key.key.swap(cmd[1]); // take the key string
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data, &key.node, &entry_eq); // find in hashtable
+    if (!node)
+    { // key missing?
+        out_int(out, -1);
+        return;
+    }
+    Entry *ent = container_of(node, Entry, node); // get the Entry
+    bool had_ttl = (ent->heap_idx != (size_t)-1); // did it have a TTL?
+    entry_set_ttl(ent, -1);                       // remove the TTL
+    out_int(out, had_ttl ? 1 : 0);                // 1 = removed, 0 = had none
+}
+
+// process a parsed command and fill the response
+static void do_request(vector<string> &cmd, Buffer *out)
+{
+    if (cmd.size() == 3 && cmd[0] == "set")
+    {
+        Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
+        if (node)
         {
-            break; // front not expired yet → done
+            // key exists — update value in place
+            Entry *ent = container_of(node, Entry, node);
+            ent->val.swap(cmd[2]);
         }
+        else
+        {
+            // new key — create and insert
+            Entry *ent = new Entry();
+            ent->key.swap(key.key);
+            ent->val.swap(cmd[2]);
+            ent->node.hcode = key.node.hcode;
+            hm_insert(&g_data, &ent->node);
+        }
+        out_nil(out); // set returns nil
+    }
+    else if (cmd.size() == 2 && cmd[0] == "get")
+    {
+        Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-        printf("client %d timed out\n", conn->fd);
-        conn->want_close = true; // let the cleanup pass handle it
+        HNode *node = hm_lookup(&g_data, &key.node, &entry_eq);
+        if (!node)
+        {
+            out_nil(out); // not found - nil
+            return;
+        }
+        Entry *ent = container_of(node, Entry, node);
+        out_str(out, ent->val.data(), ent->val.size()); // found a string
+    }
+    else if (cmd.size() == 2 && cmd[0] == "del")
+    {
+        Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-        // move to next — we can't just look at head again, we'd loop forever
-        // so we temporarily detach this conn from the list
-        dlist_detach(&conn->idle_node);
+        HNode *node = hm_delete(&g_data, &key.node, &entry_eq);
+        if (!node)
+        {
+            out_int(out, 0); // nothing deleted
+            return;
+        }
+        Entry *ent = container_of(node, Entry, node);
+        entry_del(ent);  // remove TTL first, then free
+        out_int(out, 1); // one key deleted
+    }
+    else if (cmd[0] == "zadd" && cmd.size() == 4)
+    {
+        do_zadd(cmd, out); // add or update member in sorted set
+    }
+    else if (cmd[0] == "zscore" && cmd.size() == 3)
+    {
+        do_zscore(cmd, out); // get member's score
+    }
+    else if (cmd[0] == "zrem" && cmd.size() == 3)
+    {
+        do_zrem(cmd, out); // remove member from sorted set
+    }
+    else if (cmd[0] == "zquery" && cmd.size() == 6)
+    {
+        do_zquery(cmd, out); // range query on sorted set
+    }
+    else if (cmd[0] == "expire" && cmd.size() == 3)
+    {
+        do_expire(cmd, out); // set TTL on a key
+    }
+    else if (cmd[0] == "ttl" && cmd.size() == 2)
+    {
+        do_ttl(cmd, out); // get remaining TTL
+    }
+    else if (cmd[0] == "persist" && cmd.size() == 2)
+    {
+        do_persist(cmd, out); // remove TTL from a key
+    }
+    else
+    {
+        out_err(out, ERR_UNKNOWN, "unkown command"); // unrecognized command
     }
 }
 
@@ -1498,17 +1718,11 @@ int main()
                 buf_append(&conn->incoming, buf, rv);
                 printf("client %d sent %zd bytes (total: %zu)\n", conn->fd, rv, buf_data_size(&conn->incoming));
 
-                //   {  // try to parse as many complete requests as possible
-                //     while (try_one_request(conn))
-                //     {
-                //         // keep going while there are complete requests
-                //     }
-                //     // // if we produced a response , switch to want -write
-                //     // if (conn->outgoing.size() > 0)
-                //     // {
-                //     //     conn->want_read = false;
-                //     //     conn->want_write = true;
-                //     // }}
+                // try to parse as many complete requests as possible
+                while (try_one_request(conn))
+                {
+                    // keep going while there are complete requests
+                }
 
                 // if we produced a response, try to write it now (optimistic)
                 if (buf_data_size(&conn->outgoing) > 0)

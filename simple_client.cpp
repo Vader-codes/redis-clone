@@ -222,6 +222,27 @@ int main()
     send_req(fd, {"zquery", "scores", "0", "", "0", "6"});
     read_res(fd);
 
+    // TTL tests
+    send_req(fd, {"set", "session", "abc123"});
+    read_res(fd); // set a key
+    send_req(fd, {"expire", "session", "2000"});
+    read_res(fd); // TTL 2 seconds
+    send_req(fd, {"ttl", "session"});
+    read_res(fd); // remaining TTL
+    send_req(fd, {"persist", "session"});
+    read_res(fd); // remove TTL
+    send_req(fd, {"ttl", "session"});
+    read_res(fd); // should be -1
+
+    // let a key expire
+    send_req(fd, {"set", "temp", "gone"});
+    read_res(fd);
+    send_req(fd, {"expire", "temp", "1500"});
+    read_res(fd); // 1.5s TTL
+    sleep(2);     // wait it out
+    send_req(fd, {"get", "temp"});
+    read_res(fd); // should be nil
+
     close(fd); // hung up
     return 0;
 }
