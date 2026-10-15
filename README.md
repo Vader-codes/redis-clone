@@ -55,7 +55,7 @@ timers: idle-connection list + TTL heap decide poll()'s timeout
 Needs `g++` and pthreads.
 
 ```
-g++ -Wall -Wextra -O2 -g event_server.cpp -o server
+g++ -Wall -Wextra -O2 -g event_server.cpp -o event_server -pthread
 g++ -Wall -Wextra -O2 -g simple_client.cpp -o client
 ```
 
